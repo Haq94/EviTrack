@@ -4,6 +4,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
+import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import numpy as np
 
 try:
@@ -112,9 +115,9 @@ def generate_sequences(
     seed: int = 0,
     return_logp: bool = False,
     extras: Optional[Dict] = None,
-) -> TrajectoryBatch:
+    ) -> TrajectoryBatch:
     """
-    Stationary latent-variable sequence generator (NO explicit time dependence).
+    Stationary latent-variable sequence generator.
     """
     if T < 1 or B < 1:
         raise ValueError("T and B must be >= 1")
