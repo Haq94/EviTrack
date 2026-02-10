@@ -12,6 +12,12 @@ class MarkovWorldModel(WorldModelBase):
     """
     def __init__(self, cfg: WorldModelConfig):
         super().__init__(cfg)
+        # transition head
+        self._transition_head = self._build_head(
+            in_dim=self.transition_in_dim(),
+            out_dim=self.dz,
+            head_cfg=self.cfg.transition,
+        )
 
     def transition_in_dim(self) -> int:
         return self.dz

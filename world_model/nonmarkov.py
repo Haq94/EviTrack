@@ -18,6 +18,12 @@ class NonMarkovWorldModel(WorldModelBase):
 
     def __init__(self, cfg: WorldModelConfig):
         super().__init__(cfg)
+        # transition head
+        self._transition_head = self._build_head(
+            in_dim=self.transition_in_dim(),
+            out_dim=self.dz,
+            head_cfg=self.cfg.transition,
+        )
         # z-memory over latents
         self.z_memory = GRUMemory(in_dim=self.dz, mem_dim=cfg.z_mem_dim)
 

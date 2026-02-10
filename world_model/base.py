@@ -41,9 +41,9 @@ class WorldModelConfig:
     prior_mu0: float = 0.0
     prior_logstd0: float = 0.0
 
-    # x-memory (optional) to summarize x_{<t}
-    use_x_memory_in_emission: bool = False
-    x_mem_dim: int = 32
+    # x-conditioning in emission: "none" | "markov" | "memory"
+    x_mode: str = "none"
+    x_mem_dim: int = 32   # only used if x_mode == "memory"
 
     # z-memory dim (NonMarkov); Markov will effectively use dz as "z_state_dim"
     z_mem_dim: int = 32
@@ -60,7 +60,7 @@ class WorldModelBase(nn.Module):
     """
     WM-only base class. No inference. No pruning. Pure generative pieces.
 
-    Your chosen semantics:
+    Chosen semantics:
       - Transition produces z_t
       - Define "current z-state" z_state_curr:
           * Markov:    z_state_curr = z_t               (dim dz)
@@ -78,16 +78,29 @@ class WorldModelBase(nn.Module):
         self.prior_logstd = nn.Parameter(torch.full((self.dz,), float(cfg.prior_logstd0)))
 
         # Optional x-memory (for emission context)
-        self.x_memory: Optional[GRUMemory] = None
-        if cfg.use_x_memory_in_emission:
+        self.x_memory = None
+        if cfg.x_mode == "memory":
             self.x_memory = GRUMemory(in_dim=self.dx, mem_dim=cfg.x_mem_dim)
+        elif cfg.x_mode in ("none", "markov"):
+            pass
+        else:
+            raise ValueError(f"Unknown x_mode={cfg.x_mode}")
 
-        # Transition head built lazily (input dim defined by subclass)
-        self._transition_head = None  # may be diag or lowrank
+        # # Transition head built lazily (input dim defined by subclass)
+        # self._transition_head = None  # may be diag or lowrank
 
-        # Emission head: input is z_state_curr (+ optional x_state_prev)
+        # Emission head: input is z_state dim + x_state dim
         emit_z_dim = self.z_state_dim()  # Markov returns dz; NonMarkov returns z_mem_dim
-        emit_in_dim = emit_z_dim + (cfg.x_mem_dim if cfg.use_x_memory_in_emission else 0)
+        if cfg.x_mode == "none":
+            x_ctx_dim = 0
+        elif cfg.x_mode == "markov":
+            x_ctx_dim = self.dx
+        elif cfg.x_mode == "memory":
+            x_ctx_dim = cfg.x_mem_dim
+        else:
+            raise ValueError(f"Unknown x_mode={cfg.x_mode}")
+
+        emit_in_dim = emit_z_dim + x_ctx_dim
 
         self._emission_head = self._build_head(
             in_dim=emit_in_dim,
@@ -151,15 +164,26 @@ class WorldModelBase(nn.Module):
     # -----------------------------
 
     def init_x_state(self, B: int, device=None, dtype=None) -> Optional[torch.Tensor]:
-        if self.x_memory is None:
+        if self.cfg.x_mode == "none":
             return None
-        return self.x_memory.init_state(B, device=device, dtype=dtype)
+        if self.cfg.x_mode == "markov":
+            # no previous x at t=1; use zeros (or learnable, but zeros is fine)
+            return torch.zeros(B, self.dx, device=device, dtype=dtype)
+        if self.cfg.x_mode == "memory":
+            assert self.x_memory is not None
+            return self.x_memory.init_state(B, device=device, dtype=dtype)
+        raise ValueError(f"Unknown x_mode={self.cfg.x_mode}")
 
     def update_x_state(self, x_state: Optional[torch.Tensor], x_t: torch.Tensor) -> Optional[torch.Tensor]:
-        if self.x_memory is None:
+        if self.cfg.x_mode == "none":
             return None
-        assert x_state is not None
-        return self.x_memory.step(x_state, x_t)
+        if self.cfg.x_mode == "markov":
+            return x_t
+        if self.cfg.x_mode == "memory":
+            assert self.x_memory is not None
+            assert x_state is not None
+            return self.x_memory.step(x_state, x_t)
+        raise ValueError(f"Unknown x_mode={self.cfg.x_mode}")
 
     # -----------------------------
     # z-state semantics (Mode 2)
@@ -189,17 +213,7 @@ class WorldModelBase(nn.Module):
     def transition_context(self, z_prev: Optional[torch.Tensor], z_state_prev: Optional[torch.Tensor]) -> torch.Tensor:
         raise NotImplementedError
 
-    def build_transition_head_if_needed(self):
-        if self._transition_head is None:
-            in_dim = self.transition_in_dim()
-            self._transition_head = self._build_head(
-                in_dim=in_dim,
-                out_dim=self.dz,
-                head_cfg=self.cfg.transition,
-            )
-
     def transition_params(self, z_prev: Optional[torch.Tensor], z_state_prev: Optional[torch.Tensor]):
-        self.build_transition_head_if_needed()
         ctx = self.transition_context(z_prev, z_state_prev)
         return self._transition_head(ctx)
 
@@ -226,11 +240,11 @@ class WorldModelBase(nn.Module):
     # -----------------------------
 
     def emission_params(self, z_state_curr: torch.Tensor, x_state_prev: Optional[torch.Tensor]):
-        if self.cfg.use_x_memory_in_emission:
+        if self.cfg.x_mode == "none":
+            inp = z_state_curr
+        else:
             assert x_state_prev is not None
             inp = torch.cat([z_state_curr, x_state_prev], dim=-1)
-        else:
-            inp = z_state_curr
         return self._emission_head(inp)
 
     def sample_emission(self, params, eps: torch.Tensor | None = None) -> torch.Tensor:
@@ -318,32 +332,25 @@ class WorldModelBase(nn.Module):
         logp_z = self.log_prob_transition(z_t, trans_params)
 
         # --- Current z-state for emission ---
-        z_state_t = self.update_z_state(z_state_prev, z_t) 
+        z_state_curr = self.z_state_curr(z_state_prev, z_t)
 
         # --- Emission ---
-        emit_params = self.emission_params(z_state_curr=z_state_t, x_state_prev=x_state_prev)
+        emit_params = self.emission_params(z_state_curr=z_state_curr, x_state_prev=x_state_prev)
         x_t = self.sample_emission(emit_params, eps=eps_x)
         logp_x = self.log_prob_emission(x_t, emit_params)
 
         # --- Update stored states AFTER sampling ---
-        # z_state_t = self.update_z_state(z_state_prev, z_t)  # NonMarkov overrides
+        z_state_t = self.update_z_state(z_state_prev, z_t)   # NonMarkov overrides; Markov can return None
         x_state_t = self.update_x_state(x_state_prev, x_t)
 
         out = {
             "z_t": z_t,
             "x_t": x_t,
-            "z_state_t": z_state_t,
+            "z_state_t": z_state_t,      # <- stored memory state
             "x_state_t": x_state_t,
             "logp_z": logp_z,
             "logp_x": logp_x,
         }
 
-        # optionally expose params for debugging
-        if isinstance(trans_params, GaussianDiagParams):
-            out["trans_params_mu"] = trans_params.mu
-            out["trans_params_logstd"] = trans_params.logstd
-        if isinstance(emit_params, GaussianDiagParams):
-            out["emit_params_mu"] = emit_params.mu
-            out["emit_params_logstd"] = emit_params.logstd
-
         return out
+
