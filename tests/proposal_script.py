@@ -12,7 +12,7 @@
 #       * update WM states with (z_t, x_t)
 #       * update Proposal states:
 #           - z_state_q updated inside propose()
-#           - x_state_q updated via observe_x(x_t) AFTER x_t is "observed"
+#           - x_state_q updated via update_x_state(x_t) AFTER x_t is "observed"
 #
 # NOTE: This is a *plumbing* test. It does not do evidence scoring or pruning.
 # It just verifies that shapes, state updates, and optional sharing work.
@@ -49,10 +49,10 @@ WM_X_MEM_DIM = 16
 WM_Z_MEM_DIM = 32
 
 # Proposal modes (forecasting-causal: proposal at time t uses only x_{<t})
-Q_Z_MODE = "memory"          # "markov" | "memory"
+Q_Z_MODE = "markov"          # "markov" | "memory"
 Q_Z_MEM_DIM = 32
 
-Q_X_MODE = "memory"          # "none" | "markov" | "memory"
+Q_X_MODE = "markov"          # "none" | "markov" | "memory"
 Q_X_MEM_DIM = 16
 
 # Optional sharing of GRU summarizers from WM into Proposal
@@ -160,7 +160,7 @@ for t in range(1, T + 1):
     wm_x_state = wm.update_x_state(wm_x_state, x_t)
 
     # 4) Update Proposal x-state AFTER observing x_t (so it becomes part of x_{<t+1})
-    q_x_state = q.observe_x(x_t, q_x_state)
+    q_x_state = q.update_x_state(x_t, q_x_state)
 
     # 5) Bookkeeping for next step
     z_prev = z_t

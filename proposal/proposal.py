@@ -85,7 +85,7 @@ class Proposal(nn.Module):
       1) Maintain (z_prev, z_state, x_state) corresponding to information available BEFORE x_t arrives.
       2) Propose z_t via propose_z(...).
       3) Score with world model likelihood of x_t.
-      4) After observing x_t, call observe_x(...) to update x_state for the next step.
+      4) After observing x_t, call update_x_state(...) to update x_state for the next step.
       5) Set z_prev <- z_t and z_state <- returned z_state_t (if memory).
 
     Note: This module never consumes x_t at time t by design.
@@ -249,8 +249,7 @@ class Proposal(nn.Module):
             return self.x_memory.init_state(B, device=device, dtype=dtype)
         raise ValueError(f"Unknown x_mode={self.cfg.x_mode}")
 
-    @torch.no_grad()
-    def observe_x(self, x_t: torch.Tensor, x_state_prev: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    def update_x_state(self, x_t: torch.Tensor, x_state_prev: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         """
         Update the proposal's x_state AFTER observing x_t.
         This makes x_t available as part of x_{<t+1} for the next proposal step.
@@ -270,7 +269,6 @@ class Proposal(nn.Module):
             return self.x_memory.step(x_state_prev, x_t)
         raise ValueError(f"Unknown x_mode={self.cfg.x_mode}")
 
-    @torch.no_grad()
     def update_z_state(self, z_state_prev: Optional[torch.Tensor], z_t: torch.Tensor) -> Optional[torch.Tensor]:
         """
         Update proposal z_state AFTER sampling z_t.
@@ -359,7 +357,6 @@ class Proposal(nn.Module):
             return GaussianLowRankDiagHead.log_prob(z_t, params)
         raise TypeError(f"Unknown params type: {type(params)}")
 
-    @torch.no_grad()
     def propose(
         self,
         *,
@@ -379,7 +376,7 @@ class Proposal(nn.Module):
           - returns logq_t
 
         NOTE: This does NOT update x_state (because x_t is not known yet).
-              Call observe_x(x_t, x_state_prev) AFTER you observe/score x_t.
+              Call update_x_state(x_t, x_state_prev) AFTER you observe/score x_t.
         """
         device, dtype = self._infer_device_dtype(device=device, dtype=dtype, z_prev=z_prev, z_state_prev=z_state_prev, x_state_prev=x_state_prev)
 

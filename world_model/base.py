@@ -277,7 +277,6 @@ class WorldModelBase(nn.Module):
     # Step (Convention A)
     # -----------------------------
 
-    @torch.no_grad()
     def step(
         self,
         *,
