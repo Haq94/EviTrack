@@ -1,4 +1,4 @@
-# tests/train_smoke_script.py
+# tests/trainer_smoke_script.py
 #
 # Smoke training script: WM + Proposal + Trainer + plots.
 # No argparse, no main(). Edit "Run parameters" and run directly.

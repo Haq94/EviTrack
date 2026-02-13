@@ -46,7 +46,10 @@ class Trainer:
         params = list(self.wm.parameters()) + list(self.proposal.parameters())
         self.opt = torch.optim.AdamW(params, lr=cfg.lr, weight_decay=cfg.weight_decay)
 
-        self.scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+        # self.scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+        device_type = next(self.wm.parameters()).device.type
+        self.scaler = torch.amp.GradScaler(device_type, enabled=cfg.amp)
+
 
     # -------------------------
     # public API
@@ -58,11 +61,12 @@ class Trainer:
 
         x = batch["x"]
         device = next(self.wm.parameters()).device
+        device_type = next(self.wm.parameters()).device.type
         x = x.to(device=device)
 
         self.opt.zero_grad(set_to_none=True)
 
-        with torch.cuda.amp.autocast(enabled=self.cfg.amp):
+        with torch.amp.autocast(device_type=device_type, enabled=self.cfg.amp):
             if self.cfg.objective == "beta_elbo":
                 loss, stats = self._beta_elbo(x, beta=self.cfg.beta)
             elif self.cfg.objective == "iwae":
@@ -70,7 +74,19 @@ class Trainer:
             else:
                 raise ValueError(f"Unknown objective={self.cfg.objective}")
 
+        # DEBUG--------------------------------------------  
+        if not torch.isfinite(loss):
+            print("Non-finite loss detected:", loss.item())
+            raise RuntimeError("Loss became NaN or Inf")
+
         self.scaler.scale(loss).backward()
+
+        # DEBUG-----------------------------------
+        for name, p in self.wm.named_parameters():
+            if p.grad is not None:
+                if not torch.isfinite(p.grad).all():
+                    print(f"NaN in gradient: {name}")
+                    raise RuntimeError("Gradient NaN detected")
 
         if self.cfg.grad_clip_norm is not None:
             self.scaler.unscale_(self.opt)

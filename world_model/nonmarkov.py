@@ -41,7 +41,7 @@ class NonMarkovWorldModel(WorldModelBase):
 
     def z_state_curr(self, z_state_prev: Optional[torch.Tensor], z_t: torch.Tensor) -> torch.Tensor:
         """
-        Current z-summary includes z_t (what you want).
+        Current z-summary includes z_t.
         """
         assert z_state_prev is not None
         z_state_curr = self.z_memory.step(z_state_prev, z_t)
