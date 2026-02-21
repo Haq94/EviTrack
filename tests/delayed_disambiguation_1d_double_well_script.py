@@ -38,7 +38,7 @@ def emit_mean(z, extras):
     z1 = z[:, :1]  # (B,1)
     x1 = z1 ** 2
     # x2
-    eps, n = 1.3, 2
+    eps, n = extras["eps"], extras["n"]
     inside = (np.abs(z1) < eps)         # (N,1) bool
     x2_inside = (z1 / eps) ** (2 * n)   # (N,1)
     x2_outside = z1                     # (N,1)
@@ -444,19 +444,27 @@ def predictive_heatmap(z_pred, *, z_min=None, z_max=None, nbins=160, eps=1e-12):
 
 if __name__ == "__main__":
     # ---- settings ----
-    T = 90
+    T = 100
     dz = 1
-    seed_data = 230
-    seed_pf = 110
+    seed_data = 4555
+    seed_pf = 4035
+
+    alpha = 1.0
+    V = 0.1
+
+    a = 4*V/alpha**2
+    b = 4*V/alpha**4
 
     extras = {
         # transition
-        "a": 0.15,
-        "b": 0.3,
-        "process_noise": 0.10,
+        "a": a,
+        "b": b,
+        "process_noise": 0.2,
         # emission
+        "n": 2,
+        "eps": 0.4,
         "k": 2.5,
-        "emit_noise": 0.15,
+        "emit_noise": 0.1,
     }
 
     # ---- build generator ----
@@ -477,7 +485,7 @@ if __name__ == "__main__":
     # ---- oracle PF ----
     z_filt, z_pred, ess = oracle_pf(
         x, prior, transition, emission,
-        N=100, seed=seed_pf,
+        N=1000, seed=seed_pf,
         extras=extras,
         resample_every=3
     )
