@@ -4,18 +4,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, Dict, Optional, Tuple
 
+from typing import Any
+from torch.utils.data import TensorDataset, DataLoader
+
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import numpy as np
+import torch
+from torch.utils.data import Dataset, DataLoader
 
-try:
-    import torch
-    from torch.utils.data import Dataset, DataLoader
-except Exception as e:  # pragma: no cover
-    torch = None
-    Dataset = object  # type: ignore
-    DataLoader = None  # type: ignore
+from data.data_bundle import DataBundle
 
 
 Array = np.ndarray
@@ -246,6 +245,86 @@ def make_dataloader(
     )
     ds = SequenceDataset(batch, device=device, dtype=dtype)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
+
+
+def build_synthetic_bundle(
+    *,
+    T: int,
+    n_train: int,
+    n_val: int,
+    n_test: int,
+    prior: GaussianPrior,
+    transition: GaussianTransition,
+    emission: GaussianEmission,
+    seed: int,
+    batch_size: int,
+    device: str = "cpu",
+    dtype=None,
+    num_workers: int = 0,
+    pin_memory: bool = False,
+    drop_last_train: bool = True,
+    include_latents_in_train: bool = False,
+    include_latents_in_val: bool = True,
+    include_latents_in_test: bool = True,
+    extras: Optional[Dict] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> DataBundle:
+    """
+    Generic builder: from (prior, transition, emission) -> DataBundle(train/val/test).
+    Train batches default to (x,) so Trainer stays unchanged.
+    Val/test can optionally return (x, z) for diagnostics.
+    """
+    if torch is None or DataLoader is None:
+        raise RuntimeError("PyTorch is not available, cannot create DataLoaders.")
+
+    if dtype is None:
+        dtype = torch.float32
+
+    def _make_loader(N: int, seed_offset: int, *, shuffle: bool, drop_last: bool, include_latents: bool):
+        batch = generate_sequences(
+            T=T,
+            B=N,
+            prior=prior,
+            transition=transition,
+            emission=emission,
+            seed=seed + seed_offset,
+            return_logp=False,
+            extras=extras,
+        )
+        x = torch.tensor(batch.x, dtype=dtype, device=device)
+        z = torch.tensor(batch.z, dtype=dtype, device=device)
+        ds = TensorDataset(x, z) if include_latents else TensorDataset(x)
+        return DataLoader(
+            ds,
+            batch_size=batch_size,
+            shuffle=shuffle,
+            drop_last=drop_last,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
+
+    train_loader = _make_loader(
+        n_train, 1000, shuffle=True, drop_last=drop_last_train, include_latents=include_latents_in_train
+    )
+    val_loader = _make_loader(
+        n_val, 9000, shuffle=False, drop_last=False, include_latents=include_latents_in_val
+    )
+
+    test_loader = None
+    if n_test and n_test > 0:
+        test_loader = _make_loader(
+            n_test, 15000, shuffle=False, drop_last=False, include_latents=include_latents_in_test
+        )
+
+    train_keys = ("x", "z") if include_latents_in_train else ("x",)
+
+    return DataBundle(
+        train=train_loader,
+        val=val_loader,
+        test=test_loader,
+        meta=meta or {},
+        batch_keys=train_keys,
+    )
 
 
 # ---------- regression test ----------

@@ -7,11 +7,13 @@ import time
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
+from collections.abc import Mapping
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
+from utils.imports import load_callable
 from training.trainer import Trainer, TrainerConfig
 from utils.bundle import ModelBundle
 from utils.builders import (
@@ -29,27 +31,30 @@ ObjectiveKind = Literal["beta_elbo", "iwae"]
 WMKind = Literal["markov", "nonmarkov"]
 DataKind = Literal["synthetic", "real"]
 
-
 @dataclass
 class DataConfig:
     kind: DataKind = "synthetic"
 
-    # Dataloader
+    # common
+    T: int = 120
     batch_size: int = 64
     num_workers: int = 0
-    pin_memory: bool = True
+    pin_memory: bool = False
 
-    # Synthetic only (runner can generate basic linear Gaussian if you don't override)
-    n_train: int = 2048
-    n_val: int = 512
-    T: int = 25
-    dz: int = 4
-    dx: int = 3
-    process_noise: float = 0.10
-    emit_noise: float = 0.15
+    # splits (common; may be ignored by some real datasets)
+    n_train: int = 4096
+    n_val: int = 1024
+    n_test: int = 0
 
-    # Real data only: your dataset pointer (path, name, etc.)
-    dataset_path: Optional[str] = None
+    # dynamic builder entrypoint (works for both synthetic + real)
+    # format: "package.module:callable"
+    builder: Optional[str] = None
+    builder_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+    # batch contents (mostly relevant for synthetic; real loaders can ignore)
+    include_latents_in_train: bool = False   # default: no
+    include_latents_in_val: bool = True      # default: yes (diagnostics)
+    include_latents_in_test: bool = True     # default: yes (diagnostics)
 
 
 @dataclass
@@ -137,7 +142,8 @@ class ExperimentRunner:
         t0 = time.time()
 
         for epoch in range(1, self.cfg.epochs + 1):
-            for (xb,) in self.train_loader:
+            for batch in self.train_loader:
+                xb = self._get_x_from_batch(batch)
                 global_step += 1
                 stats = self.trainer.train_step({"x": xb})
 
@@ -176,7 +182,8 @@ class ExperimentRunner:
             return {"loss": float("nan")}
 
         losses: List[float] = []
-        for i, (xb,) in enumerate(self.val_loader):
+        for i, batch in enumerate(self.val_loader):
+            xb = self._get_x_from_batch(batch)
             out = self.trainer.eval_step({"x": xb})
             losses.append(out["loss"])
             if max_batches is not None and (i + 1) >= max_batches:
@@ -265,60 +272,54 @@ class ExperimentRunner:
         bundle.save(out_dir)
 
     # -------------------------
-    # Synthetic fallback generator (simple linear Gaussian)
+    # Synthetic generator
     # -------------------------
-    def _build_synthetic_data(self) -> Tuple[DataLoader, DataLoader]:
-        """
-        Minimal synthetic generator so runner works out-of-the-box.
-        If you prefer your own generator, replace this with your file.
-        """
+    def _build_synthetic_data(self):
         dc = self.cfg.data_cfg
-        rng = np.random.default_rng(self.cfg.seed)
 
-        dz, dx, T = dc.dz, dc.dx, dc.T
-        A = rng.standard_normal((dz, dz)) * 0.2
-        u, s, vt = np.linalg.svd(A, full_matrices=False)
-        s = np.clip(s, 0.0, 0.9)
-        A = (u * s) @ vt
-        C = rng.standard_normal((dx, dz)) * 0.8
+        if dc.builder is None:
+            raise ValueError("DataConfig.builder must be set for synthetic data.")
 
-        def gen(N: int, seed0: int) -> torch.Tensor:
-            xs = np.zeros((N, T, dx), dtype=np.float32)
-            for i in range(N):
-                r = np.random.default_rng(seed0 + i)
-                z = r.standard_normal((T, dz)).astype(np.float32)
-                # build z trajectory
-                for t in range(1, T):
-                    z[t] = (A @ z[t - 1]) + (dc.process_noise * r.standard_normal(dz).astype(np.float32))
-                # emit x
-                x = (z @ C.T) + (dc.emit_noise * r.standard_normal((T, dx)).astype(np.float32))
-                xs[i] = x
-            return torch.tensor(xs, dtype=self.dtype)
+        build = load_callable(dc.builder)
 
-        x_train = gen(dc.n_train, seed0=1000)
-        x_val = gen(dc.n_val, seed0=9000)
-
-        train_loader = DataLoader(
-            TensorDataset(x_train),
+        bundle = build(
+            T=dc.T,
+            n_train=dc.n_train,
+            n_val=dc.n_val,
+            n_test=dc.n_test,
             batch_size=dc.batch_size,
-            shuffle=True,
-            drop_last=True,
+            seed=self.cfg.seed,
+            device="cpu",
+            dtype=self.dtype,
             num_workers=dc.num_workers,
             pin_memory=dc.pin_memory and (self.device.type == "cuda"),
+            include_latents_in_train=dc.include_latents_in_train,
+            include_latents_in_val=dc.include_latents_in_val,
+            include_latents_in_test=dc.include_latents_in_val,
+            **dc.builder_kwargs,
         )
-        val_loader = DataLoader(
-            TensorDataset(x_val),
-            batch_size=dc.batch_size,
-            shuffle=False,
-            drop_last=False,
-            num_workers=dc.num_workers,
-            pin_memory=dc.pin_memory and (self.device.type == "cuda"),
-        )
-        return train_loader, val_loader
+
+        return bundle.train, bundle.val
 
     # -------------------------
     # Utils
     # -------------------------
+    @staticmethod
+    def _get_x_from_batch(batch) -> torch.Tensor:
+        """
+        Supports:
+        - dict batch: {"x": ... , ...}
+        - tuple/list batch: (x,) or (x, z) or (x, z, ...)
+        - raw tensor batch: x
+        """
+        if isinstance(batch, Mapping):
+            return batch["x"]
+        if isinstance(batch, (tuple, list)):
+            return batch[0]
+        if torch.is_tensor(batch):
+            return batch
+        raise TypeError(f"Unsupported batch type: {type(batch)}")
+
     @staticmethod
     def _parse_dtype(s: str) -> torch.dtype:
         s = s.lower()

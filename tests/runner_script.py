@@ -36,7 +36,7 @@ SAVE_EVERY_STEPS = 100
 
 WM_KIND = "nonmarkov"
 DZ = 4
-DX = 3
+DX = 1
 T = 25
 
 OBJECTIVE = "beta_elbo"   # "beta_elbo" | "iwae"
@@ -81,12 +81,19 @@ trainer_cfg = TrainerConfig(
 
 data_cfg = DataConfig(
     kind="synthetic",
+    builder="data.synthetic_tasks.doublewell_1d:build_loaders",
+    builder_kwargs=dict(
+        a=3.0,
+        V=0.06,
+        sigma_z=0.05,
+        d=2.0,
+        n=1,
+        sigma_x=0.12,
+    ),
     batch_size=BATCH_SIZE,
     n_train=N_TRAIN,
     n_val=N_VAL,
     T=T,
-    dz=DZ,
-    dx=DX,
 )
 
 run_cfg = RunConfig(
