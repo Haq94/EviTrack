@@ -12,8 +12,8 @@ from data.synthetic_generator import (
 
 def make_prior(*, z0_mean: float = 0.0, z0_std: float = 1.0) -> GaussianPrior:
     return GaussianPrior(
-        mu0=np.array([z0_mean], dtype=float),
-        cov0=np.array([[z0_std**2]], dtype=float),
+        mu0=torch.tensor([z0_mean], dtype=torch.float32),
+        cov0=torch.tensor([[z0_std**2]], dtype=torch.float32),
     )
 
 def make_transition(*, a: float = 3.0, V: float = 0.06, dt: float = 1.0, sigma_z: float = 0.05) -> GaussianTransition:
@@ -24,23 +24,31 @@ def make_transition(*, a: float = 3.0, V: float = 0.06, dt: float = 1.0, sigma_z
         return z_prev - grad_U(z_prev) * dt
 
     def cov_fn(z_prev, extras):
-        return np.array([[sigma_z**2]], dtype=float)
+        return torch.full(
+            (z_prev.shape[0], 1, 1),
+            sigma_z**2,
+            device=z_prev.device,
+            dtype=z_prev.dtype,
+            )
 
     return GaussianTransition(mean_fn=mean_fn, cov_fn=cov_fn)
 
 def make_emission(*, d: float = 2.0, n: int = 1, sigma_x: float = 0.12) -> GaussianEmission:
-    def h(z):
-        out = np.empty_like(z)
-        m = (np.abs(z) <= d)
-        out[m] = z[m] ** (2 * n)
-        out[~m] = z[~m]
-        return out
 
     def mean_fn(z_t, extras):
-        return h(z_t)
+        mask = (z_t.abs() <= d)
+        out = torch.empty_like(z_t)
+        out[mask] = z_t[mask] ** (2 * n)
+        out[~mask] = z_t[~mask]
+        return out
 
     def cov_fn(z_t, extras):
-        return np.array([[sigma_x**2]], dtype=float)
+        return torch.full(
+            (z_t.shape[0], 1, 1),
+            sigma_x**2,
+            device=z_t.device,
+            dtype=z_t.dtype,
+            )
 
     return GaussianEmission(mean_fn=mean_fn, cov_fn=cov_fn)
 

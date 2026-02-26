@@ -1,107 +1,86 @@
 # data/synthetic_generator.py
 from __future__ import annotations
-
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
-
-from typing import Any
-from torch.utils.data import TensorDataset, DataLoader
-
+from typing import Callable, Dict, Optional, Any
+import torch
+from torch.utils.data import Dataset, DataLoader, TensorDataset
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import numpy as np
-import torch
-from torch.utils.data import Dataset, DataLoader
-
 from data.data_bundle import DataBundle
 
-
-Array = np.ndarray
+Tensor = torch.Tensor
 
 # ---------- batched Gaussian utils ----------
 
-def _batchify_vec(v: Array, B: int, d: int) -> Array:
-    v = np.asarray(v, dtype=float)
+def _batchify_vec(v: Tensor, B: int, d: int) -> Tensor:
     if v.shape == (d,):
-        return np.broadcast_to(v, (B, d)).copy()
+        return v.unsqueeze(0).expand(B, d).contiguous()
     if v.shape == (B, d):
         return v
-    raise ValueError(f"Expected {(d,)} or {(B, d)}, got {v.shape}")
+    raise ValueError(f"Expected {(d,)} or {(B, d)}, got {tuple(v.shape)}")
 
 
-def _batchify_mat(M: Array, B: int, d: int) -> Array:
-    M = np.asarray(M, dtype=float)
+def _batchify_mat(M: Tensor, B: int, d: int) -> Tensor:
     if M.shape == (d, d):
-        return np.broadcast_to(M, (B, d, d)).copy()
+        return M.unsqueeze(0).expand(B, d, d).contiguous()
     if M.shape == (B, d, d):
         return M
-    raise ValueError(f"Expected {(d, d)} or {(B, d, d)}, got {M.shape}")
+    raise ValueError(f"Expected {(d, d)} or {(B, d, d)}, got {tuple(M.shape)}")
 
 
-def sample_gaussian(mu: Array, cov: Array, rng: np.random.Generator) -> Array:
-    """mu (B,d), cov (B,d,d) -> samples (B,d)"""
+def sample_gaussian(mu: Tensor, cov: Tensor, gen: torch.Generator) -> Tensor:
+    """
+    mu: (B,d), cov: (B,d,d) -> samples: (B,d)
+    """
     B, d = mu.shape
-    eps = rng.standard_normal((B, d))
-    out = np.empty((B, d), dtype=float)
-    for b in range(B):
-        L = np.linalg.cholesky(cov[b])
-        out[b] = mu[b] + L @ eps[b]
-    return out
+    eps = torch.randn((B, d), device=mu.device, dtype=mu.dtype, generator=gen)
+    L = torch.linalg.cholesky(cov)            # (B,d,d)
+    return mu + torch.einsum("bij,bj->bi", L, eps)
 
 
-def logpdf_gaussian(x: Array, mu: Array, cov: Array) -> Array:
-    """x,mu (B,d), cov (B,d,d) -> logpdf (B,)"""
+def logpdf_gaussian(x: Tensor, mu: Tensor, cov: Tensor) -> Tensor:
+    """
+    x,mu: (B,d), cov: (B,d,d) -> logpdf: (B,)
+    """
     B, d = x.shape
-    const = -0.5 * d * np.log(2.0 * np.pi)
-    lp = np.empty((B,), dtype=float)
-    for b in range(B):
-        L = np.linalg.cholesky(cov[b])
-        y = np.linalg.solve(L, x[b] - mu[b])
-        maha = float(y @ y)
-        logdet = float(2.0 * np.sum(np.log(np.diag(L))))
-        lp[b] = const - 0.5 * (logdet + maha)
-    return lp
+    L = torch.linalg.cholesky(cov)            # (B,d,d)
+    diff = (x - mu).unsqueeze(-1)             # (B,d,1)
+
+    # Solve L y = diff
+    y = torch.linalg.solve_triangular(L, diff, upper=False).squeeze(-1)  # (B,d)
+    maha = (y * y).sum(dim=-1)                # (B,)
+    logdet = 2.0 * torch.log(torch.diagonal(L, dim1=-2, dim2=-1)).sum(dim=-1)  # (B,)
+
+    const = -0.5 * d * torch.log(torch.tensor(2.0 * torch.pi, device=x.device, dtype=x.dtype))
+    return const - 0.5 * (logdet + maha)
 
 
 # ---------- stationary model specs ----------
 
 @dataclass
 class GaussianPrior:
-    """z1 ~ N(mu0, cov0)"""
-    mu0: Array        # (dz,)
-    cov0: Array       # (dz,dz)
+    mu0: Tensor   # (dz,)
+    cov0: Tensor  # (dz,dz)
 
 
 @dataclass
 class GaussianTransition:
-    """
-    z_t | z_{t-1} ~ N( mu(z_{t-1}), cov(z_{t-1}) )
-
-    mean_fn: (z_prev (B,dz), extras) -> (B,dz) or (dz,)
-    cov_fn:  (z_prev (B,dz), extras) -> (B,dz,dz) or (dz,dz)
-    """
-    mean_fn: Callable[[Array, Dict], Array]
-    cov_fn: Callable[[Array, Dict], Array]
+    mean_fn: Callable[[Tensor, Dict], Tensor]   # (B,dz)->(B,dz) or (dz,)
+    cov_fn: Callable[[Tensor, Dict], Tensor]    # (B,dz)->(B,dz,dz) or (dz,dz)
 
 
 @dataclass
 class GaussianEmission:
-    """
-    x_t | z_t ~ N( mu(z_t), cov(z_t) )
-
-    mean_fn: (z (B,dz), extras) -> (B,dx) or (dx,)
-    cov_fn:  (z (B,dz), extras) -> (B,dx,dx) or (dx,dx)
-    """
-    mean_fn: Callable[[Array, Dict], Array]
-    cov_fn: Callable[[Array, Dict], Array]
+    mean_fn: Callable[[Tensor, Dict], Tensor]   # (B,dz)->(B,dx) or (dx,)
+    cov_fn: Callable[[Tensor, Dict], Tensor]    # (B,dz)->(B,dx,dx) or (dx,dx)
 
 
 @dataclass
 class TrajectoryBatch:
-    z: Array                 # (B,T,dz)
-    x: Array                 # (B,T,dx)
-    logp: Optional[Array]    # (B,) if requested
+    z: Tensor                 # (B,T,dz)
+    x: Tensor                 # (B,T,dx)
+    logp: Optional[Tensor]    # (B,) if requested
 
 
 def generate_sequences(
@@ -114,69 +93,80 @@ def generate_sequences(
     seed: int = 0,
     return_logp: bool = False,
     extras: Optional[Dict] = None,
-    ) -> TrajectoryBatch:
-    """
-    Stationary latent-variable sequence generator.
-    """
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+) -> TrajectoryBatch:
     if T < 1 or B < 1:
         raise ValueError("T and B must be >= 1")
 
     extras = {} if extras is None else dict(extras)
-    rng = np.random.default_rng(seed)
+    device = torch.device(device)
 
-    mu0_vec = np.asarray(prior.mu0, dtype=float)
+    gen = torch.Generator(device="cpu")  # torch.Generator is CPU-backed; that’s fine
+    gen.manual_seed(seed)
+
+    mu0_vec = prior.mu0.to(device=device, dtype=dtype)
+    cov0_mat = prior.cov0.to(device=device, dtype=dtype)
     dz = int(mu0_vec.shape[0])
 
-    # z1
     mu0 = _batchify_vec(mu0_vec, B, dz)
-    cov0 = _batchify_mat(prior.cov0, B, dz)
-    z1 = sample_gaussian(mu0, cov0, rng)  # (B,dz)
+    cov0 = _batchify_mat(cov0_mat, B, dz)
+
+    # z1
+    z1 = sample_gaussian(mu0, cov0, gen)  # (B,dz)
 
     # infer dx from emission mean
-    mu_x1_raw = np.asarray(emission.mean_fn(z1, extras), dtype=float)
+    mu_x1_raw = emission.mean_fn(z1, extras)
     if mu_x1_raw.ndim == 1:
         dx = int(mu_x1_raw.shape[0])
-        mu_x1 = _batchify_vec(mu_x1_raw, B, dx)
+        mu_x1 = _batchify_vec(mu_x1_raw.to(device=device, dtype=dtype), B, dx)
     elif mu_x1_raw.ndim == 2:
         dx = int(mu_x1_raw.shape[1])
-        mu_x1 = mu_x1_raw
+        mu_x1 = mu_x1_raw.to(device=device, dtype=dtype)
     else:
-        raise ValueError(f"Emission mean must be (dx,) or (B,dx), got {mu_x1_raw.shape}")
+        raise ValueError(f"Emission mean must be (dx,) or (B,dx), got {tuple(mu_x1_raw.shape)}")
 
-    z = np.empty((B, T, dz), dtype=float)
-    x = np.empty((B, T, dx), dtype=float)
+    z = torch.empty((B, T, dz), device=device, dtype=dtype)
+    x = torch.empty((B, T, dx), device=device, dtype=dtype)
     z[:, 0, :] = z1
 
-    logp = np.zeros((B,), dtype=float) if return_logp else None
+    logp = torch.zeros((B,), device=device, dtype=dtype) if return_logp else None
     if return_logp:
-        logp += logpdf_gaussian(z1, mu0, cov0)
+        logp = logp + logpdf_gaussian(z1, mu0, cov0)
 
     # x1
-    cov_x1 = _batchify_mat(emission.cov_fn(z1, extras), B, dx)
-    x1 = sample_gaussian(mu_x1, cov_x1, rng)
+    cov_x1_raw = emission.cov_fn(z1, extras).to(device=device, dtype=dtype)
+    cov_x1 = _batchify_mat(cov_x1_raw, B, dx)
+    x1 = sample_gaussian(mu_x1, cov_x1, gen)
     x[:, 0, :] = x1
     if return_logp:
-        logp += logpdf_gaussian(x1, mu_x1, cov_x1)
+        logp = logp + logpdf_gaussian(x1, mu_x1, cov_x1)
 
     # rollout
-    for _t in range(1, T):
-        z_prev = z[:, _t - 1, :]
+    for t in range(1, T):
+        z_prev = z[:, t - 1, :]
 
-        mu_t = _batchify_vec(np.asarray(transition.mean_fn(z_prev, extras), dtype=float), B, dz)
-        cov_t = _batchify_mat(np.asarray(transition.cov_fn(z_prev, extras), dtype=float), B, dz)
+        mu_t_raw = transition.mean_fn(z_prev, extras)
+        mu_t = _batchify_vec(mu_t_raw.to(device=device, dtype=dtype), B, dz)
 
-        z_t = sample_gaussian(mu_t, cov_t, rng)
-        z[:, _t, :] = z_t
+        cov_t_raw = transition.cov_fn(z_prev, extras).to(device=device, dtype=dtype)
+        cov_t = _batchify_mat(cov_t_raw, B, dz)
+
+        z_t = sample_gaussian(mu_t, cov_t, gen)
+        z[:, t, :] = z_t
         if return_logp:
-            logp += logpdf_gaussian(z_t, mu_t, cov_t)
+            logp = logp + logpdf_gaussian(z_t, mu_t, cov_t)
 
-        mu_xt = _batchify_vec(np.asarray(emission.mean_fn(z_t, extras), dtype=float), B, dx)
-        cov_xt = _batchify_mat(np.asarray(emission.cov_fn(z_t, extras), dtype=float), B, dx)
+        mu_xt_raw = emission.mean_fn(z_t, extras)
+        mu_xt = _batchify_vec(mu_xt_raw.to(device=device, dtype=dtype), B, dx)
 
-        x_t = sample_gaussian(mu_xt, cov_xt, rng)
-        x[:, _t, :] = x_t
+        cov_xt_raw = emission.cov_fn(z_t, extras).to(device=device, dtype=dtype)
+        cov_xt = _batchify_mat(cov_xt_raw, B, dx)
+
+        x_t = sample_gaussian(mu_xt, cov_xt, gen)
+        x[:, t, :] = x_t
         if return_logp:
-            logp += logpdf_gaussian(x_t, mu_xt, cov_xt)
+            logp = logp + logpdf_gaussian(x_t, mu_xt, cov_xt)
 
     return TrajectoryBatch(z=z, x=x, logp=logp)
 
@@ -184,23 +174,15 @@ def generate_sequences(
 # ---------- PyTorch Dataset + DataLoader wrapper ----------
 
 class SequenceDataset(Dataset):
-    """
-    Simple dataset that yields dicts: {"x": (T,dx), "z": (T,dz)} (and optional "logp": scalar)
-    """
-    def __init__(self, batch: TrajectoryBatch, *, device: str = "cpu", dtype=torch.float32):
-        if torch is None:
-            raise RuntimeError("PyTorch is not available, cannot create SequenceDataset.")
-
-        self.x = torch.tensor(batch.x, dtype=dtype, device=device)  # (B,T,dx)
-        self.z = torch.tensor(batch.z, dtype=dtype, device=device)  # (B,T,dz)
-        self.logp = None
-        if batch.logp is not None:
-            self.logp = torch.tensor(batch.logp, dtype=dtype, device=device)  # (B,)
+    def __init__(self, batch: TrajectoryBatch):
+        self.x = batch.x
+        self.z = batch.z
+        self.logp = batch.logp
 
     def __len__(self) -> int:
         return int(self.x.shape[0])
 
-    def __getitem__(self, idx: int) -> Dict[str, "torch.Tensor"]:
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         out = {"x": self.x[idx], "z": self.z[idx]}
         if self.logp is not None:
             out["logp"] = self.logp[idx]
@@ -242,8 +224,10 @@ def make_dataloader(
         seed=seed,
         return_logp=return_logp,
         extras=extras,
+        device=device,
+        dtype=dtype,
     )
-    ds = SequenceDataset(batch, device=device, dtype=dtype)
+    ds = SequenceDataset(batch)
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
 
@@ -291,8 +275,8 @@ def build_synthetic_bundle(
             return_logp=False,
             extras=extras,
         )
-        x = torch.tensor(batch.x, dtype=dtype, device=device)
-        z = torch.tensor(batch.z, dtype=dtype, device=device)
+        x = batch.x
+        z = batch.z
         ds = TensorDataset(x, z) if include_latents else TensorDataset(x)
         return DataLoader(
             ds,
@@ -332,39 +316,22 @@ def build_synthetic_bundle(
 if __name__ == "__main__":
     # Minimal stationary linear-Gaussian example (no explicit time dependence)
 
-    # dims
-    dz = 2
-    dx = 2
+    dz, dx = 2, 2
+    prior = GaussianPrior(mu0=torch.zeros(dz), cov0=0.5 * torch.eye(dz))
 
-    # prior
-    prior = GaussianPrior(
-        mu0=np.zeros((dz,)),
-        cov0=0.5 * np.eye(dz),
-    )
+    A = torch.tensor([[0.95, 0.05], [0.00, 0.98]])
+    Q = 0.05 * torch.eye(dz)
 
-    # transition: z_t = A z_{t-1} + noise
-    A = np.array([[0.95, 0.05],
-                  [0.00, 0.98]], dtype=float)
-    Q = 0.05 * np.eye(dz)
-
-    def trans_mean(z_prev: Array, extras: Dict) -> Array:
-        return (z_prev @ A.T)  # (B,dz)
-
-    def trans_cov(z_prev: Array, extras: Dict) -> Array:
-        # stationary covariance (could be state-dependent; keep simple)
-        return Q  # (dz,dz) broadcast OK
+    def trans_mean(z_prev, extras): return z_prev @ A.T
+    def trans_cov(z_prev, extras):  return Q
 
     transition = GaussianTransition(mean_fn=trans_mean, cov_fn=trans_cov)
 
-    # emission: x_t = H z_t + noise
-    H = np.eye(dx, dz)
-    R = 0.10 * np.eye(dx)
+    H = torch.eye(dx, dz)
+    R = 0.10 * torch.eye(dx)
 
-    def emit_mean(z: Array, extras: Dict) -> Array:
-        return (z @ H.T)  # (B,dx)
-
-    def emit_cov(z: Array, extras: Dict) -> Array:
-        return R  # (dx,dx) broadcast OK
+    def emit_mean(z, extras): return z @ H.T
+    def emit_cov(z, extras):  return R
 
     emission = GaussianEmission(mean_fn=emit_mean, cov_fn=emit_cov)
 
