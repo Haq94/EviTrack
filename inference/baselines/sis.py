@@ -1,4 +1,11 @@
 # inference/baselines/sis.py
+from __future__ import annotations
+import torch
+
+from ..base import InferenceEngine
+from ..types import Particle, ParticleState, StepStats, CostCounter
+
+Tensor = torch.Tensor
 
 class SISEngine(InferenceEngine):
     def __init__(self, *, wm, proposal, N: int):
@@ -36,6 +43,8 @@ class SISEngine(InferenceEngine):
         for p in state.particles:
             z_prev = p.z_t if t_new > 1 else None
 
+            state.cost.add_proposal(1)
+
             q_out = self.proposal.propose(
                 B=x_t.shape[0],
                 z_prev=z_prev,
@@ -48,6 +57,8 @@ class SISEngine(InferenceEngine):
             logq_t = q_out["logq"]
             q_z_state = q_out["z_state_t"]
 
+            state.cost.add_transition(1)
+
             if t_new == 1:
                 logpzt = self.wm.log_prob_z1(z_t)
             else:
@@ -56,6 +67,8 @@ class SISEngine(InferenceEngine):
                     z_state_prev=p.wm_z_state,
                 )
                 logpzt = self.wm.log_prob_transition(z_t, trans_params)
+
+            state.cost.add_emission(1)
 
             z_state_curr = self.wm.z_state_curr(p.wm_z_state, z_t)
             emit_params = self.wm.emission_params(

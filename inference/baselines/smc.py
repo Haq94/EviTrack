@@ -50,6 +50,7 @@ class SMCEngine(InferenceEngine):
             z_prev = p.z_t if t_new > 1 else None
 
             # --- proposal sample (this is the sampling) ---
+            state.cost.add_proposal(1)
             q_out = self.proposal.propose(
                 B=x_t.shape[0],
                 z_prev=z_prev,
@@ -63,6 +64,7 @@ class SMCEngine(InferenceEngine):
             q_z_state = q_out["z_state_t"]
 
             # --- transition log prob ---
+            state.cost.add_transition(1)
             if t_new == 1:
                 logpzt = self.wm.log_prob_z1(z_t)
             else:
@@ -73,6 +75,7 @@ class SMCEngine(InferenceEngine):
                 logpzt = self.wm.log_prob_transition(z_t, trans_params)
 
             # --- emission log prob ---
+            state.cost.add_emission(1)
             z_state_curr = self.wm.z_state_curr(p.wm_z_state, z_t)
             emit_params = self.wm.emission_params(
                 z_state_curr=z_state_curr,

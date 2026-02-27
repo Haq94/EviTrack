@@ -1,7 +1,8 @@
 # inference/utils.py
 from __future__ import annotations
 import torch
-from typing import List, Tuple
+from typing import List
+import dataclasses
 
 Tensor = torch.Tensor
 
@@ -26,3 +27,26 @@ def topk_indices(scores: Tensor, k: int) -> Tensor:
 def stack_scores(scores: List[Tensor]) -> Tensor:
     # list of [B] -> [K, B]
     return torch.stack(scores, dim=0)
+
+def tree_clone(obj):
+    """
+    Recursively clone nested tensors inside lists/tuples/dicts/dataclasses.
+    Prevents aliasing after resampling.
+    """
+    if torch.is_tensor(obj):
+        return obj.clone()
+
+    # ---- dataclasses support (Particle, Hypothesis, etc.) ----
+    if dataclasses.is_dataclass(obj):
+        kwargs = {}
+        for f in dataclasses.fields(obj):
+            kwargs[f.name] = tree_clone(getattr(obj, f.name))
+        return obj.__class__(**kwargs)
+
+    if isinstance(obj, list):
+        return [tree_clone(x) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(tree_clone(x) for x in obj)
+    if isinstance(obj, dict):
+        return {k: tree_clone(v) for k, v in obj.items()}
+    return obj
