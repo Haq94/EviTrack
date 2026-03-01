@@ -1,23 +1,35 @@
 # inference/evitrack.py
 from __future__ import annotations
+import dataclasses
 from dataclasses import dataclass
-from typing import List, Tuple, Any
+from typing import List, Tuple, Optional, Any
 import torch
 
 from .base import InferenceEngine
 from .types import Hypothesis, EviTrackState, StepStats, CostCounter
-from .utils import topk_indices, stack_scores, normalize_logweights
+from .utils import topk_per_batch, stack_scores, normalize_logweights
 
 Tensor = torch.Tensor
 
+# @dataclass
+# class EviTrackConfig:
+#     K: int                  # keep
+#     C: int                  # children per parent
+#     tau: int = 1            # prune every tau steps
+#     expand: str = "proposal"  # {"proposal","transition"}
+#     prune_score: str = "evidence"  # {"evidence","joint"}
+#     weight_mode: str = "evidence"  # {"evidence","joint"}
+
 @dataclass
 class EviTrackConfig:
-    K: int                  # keep
-    C: int                  # children per parent
-    tau: int = 1            # prune every tau steps
-    expand: str = "proposal"  # {"proposal","transition"}
-    prune_score: str = "evidence"  # {"evidence","joint"}
-    weight_mode: str = "evidence"  # {"evidence","joint"}
+    K: int
+    C: int
+    tau: int = 1
+    G: int = 1                 # every G steps do GLOBAL prune; otherwise LOCAL prune
+    local_keep: Optional[int] = None  # how many children to keep per parent during LOCAL prune (<= C). default: min(C,K)
+    expand: str = "proposal"   # "proposal" or "transition"
+    prune_score: str = "evidence"  # "evidence" or "joint"
+    weight_mode: str = "evidence"   # "evidence" or "joint"
 
 class EviTrackEngine(InferenceEngine):
     def __init__(self, *, wm, proposal, cfg: EviTrackConfig):
@@ -56,72 +68,46 @@ class EviTrackEngine(InferenceEngine):
         )
         return EviTrackState(hyps=[h0], t=0, cost=CostCounter())
 
-    def step(self, state: EviTrackState, x_t: Tensor) -> Tuple[EviTrackState, StepStats]:
+    def step(self, state: EviTrackState, x_t: Tensor):
         cfg = self.cfg
-        B = x_t.shape[0]
         t_new = state.t + 1
 
-        # Expand parents -> candidates
-        candidates: List[Hypothesis] = []
-        for parent in state.hyps:
-            for _ in range(cfg.C):
-                # cost accounting per child:
-                if t_new == 1:
-                    if cfg.expand == "proposal":
-                        state.cost.add_proposal(1)
-                    else:
-                        state.cost.add_transition(1)  # "prior" sample treated as transition/prior eval
-                else:
-                    if cfg.expand == "proposal":
-                        state.cost.add_proposal(1)
-                        state.cost.add_transition(1)  # you still score log p(z_t | ...)
-                    else:
-                        state.cost.add_transition(1)
-                state.cost.add_emission(1)
+        # Always create groups per parent (even if we later do global)
+        candidate_groups = []
 
-                child = self._expand_one(parent, x_t, t_new)
-                candidates.append(child)
-
-        # TODO: We are getting rid of delayed pruning in favor of local vs global pruning. Well maybe keep it but just default to one.
-        # Possibly delay pruning
-        do_prune = (t_new % cfg.tau == 0)
-
-        if do_prune:
-            # choose score tensor [Kcand,B]
-            if cfg.prune_score == "joint":
-                S = stack_scores([c.J for c in candidates])
-            else:
-                S = stack_scores([c.E for c in candidates])
-
-            keep_idx = topk_indices(S, k=cfg.K).tolist()
-            kept = [candidates[i] for i in keep_idx]
+        if t_new == 1:
+            # Start with exactly K children from root (your desired semantics)
+            root = state.hyps[0]
+            group = []
+            for _ in range(cfg.K):
+                group.append(self._expand_one(root, x_t, t_new))
+            candidate_groups = [group]
         else:
-            # keep all candidates (can grow); still cap if you want safety
-            kept = candidates
+            for parent in state.hyps:
+                group = []
+                for _ in range(cfg.C):
+                    group.append(self._expand_one(parent, x_t, t_new))
+                candidate_groups.append(group)
 
-        new_state = EviTrackState(hyps=kept, t=t_new, cost=state.cost)
+        do_prune = (t_new % cfg.tau == 0)
+        if do_prune:
+            kept = self.prune(t_new=t_new, candidate_groups=candidate_groups)
+        else:
+            # no pruning => flatten all groups
+            kept = [c for g in candidate_groups for c in g]
 
-        stats = StepStats(
-            t=t_new,
-            kept=len(kept),
-            candidates=len(candidates),
-            cost=new_state.cost,
-            extra={"do_prune": do_prune},
-        )
-        return new_state, stats
+        state.hyps = kept
+        state.t = t_new
+
+        stats = StepStats(t=t_new, kept=len(kept), candidates=sum(len(g) for g in candidate_groups), cost=state.cost)
+        return state, stats
 
     def get_mixture(self, state: EviTrackState):
-        # returns normalized weights over hypotheses (scalar per hypothesis) + hyps
-        cfg = self.cfg
-        assert len(state.hyps) > 0
-
-        # use batch-averaged log-weight for each hypothesis
-        if cfg.weight_mode == "joint":
-            logw = torch.stack([h.J.mean() for h in state.hyps], dim=0)  # [K]
+        if self.cfg.weight_mode == "joint":
+            logw = torch.stack([h.J for h in state.hyps], dim=0)  # [K,B]
         else:
-            logw = torch.stack([h.E.mean() for h in state.hyps], dim=0)  # [K]
-
-        w = normalize_logweights(logw, dim=0)  # [K], sums to 1
+            logw = torch.stack([h.E for h in state.hyps], dim=0)  # [K,B]
+        w = normalize_logweights(logw, dim=0).T  # [B,K]
         return w, state.hyps
 
     # ------------------------
@@ -207,3 +193,130 @@ class EviTrackEngine(InferenceEngine):
             J=J_new,
             E=E_new,
         )
+    
+    # ------------------------
+    # internal: pruning
+    # ------------------------
+    def prune(self, *, t_new: int, candidate_groups):
+        """
+        candidate_groups: list of lists.
+            Each inner list = children from ONE parent.
+
+        LOCAL prune:
+            each parent keeps exactly 1 child (per batch element).
+
+        GLOBAL prune:
+            pool all children and keep top-K (per batch element).
+        """
+        cfg = self.cfg
+
+        # --------------------------------------------------
+        # Helper: stack list of hypotheses into [N,B,...]
+        # --------------------------------------------------
+        def stack_list(xs):
+            x0 = xs[0]
+            if torch.is_tensor(x0):
+                return torch.stack(xs, dim=0)
+            if dataclasses.is_dataclass(x0):
+                kwargs = {
+                    f.name: stack_list([getattr(x, f.name) for x in xs])
+                    for f in dataclasses.fields(x0)
+                }
+                return x0.__class__(**kwargs)
+            if isinstance(x0, dict):
+                return {k: stack_list([x[k] for x in xs]) for k in x0.keys()}
+            if isinstance(x0, (list, tuple)):
+                return type(x0)(
+                    [stack_list([x[i] for x in xs]) for i in range(len(x0))]
+                )
+            return x0
+
+        # --------------------------------------------------
+        # Helper: gather top-k per batch
+        # --------------------------------------------------
+        def gather_bk(stacked, idx_bk):
+            """
+            stacked tensors: [N,B,...]
+            idx_bk: [B,K]
+            returns list length K of hypotheses with tensors [B,...]
+            """
+            B, K = idx_bk.shape
+
+            def gather_node(node):
+                if torch.is_tensor(node):
+                    nodeB = node.transpose(0, 1)  # [B,N,...]
+                    idx = idx_bk
+                    for _ in range(nodeB.ndim - 2):
+                        idx = idx.unsqueeze(-1)
+                    idx = idx.expand((B, K) + nodeB.shape[2:])
+                    out = torch.gather(nodeB, 1, idx)  # [B,K,...]
+                    return out
+                if dataclasses.is_dataclass(node):
+                    kwargs = {
+                        f.name: gather_node(getattr(node, f.name))
+                        for f in dataclasses.fields(node)
+                    }
+                    return node.__class__(**kwargs)
+                if isinstance(node, dict):
+                    return {k: gather_node(v) for k, v in node.items()}
+                if isinstance(node, (list, tuple)):
+                    return type(node)([gather_node(v) for v in node])
+                return node
+
+            gathered = gather_node(stacked)
+
+            def split_k(node, k):
+                if torch.is_tensor(node):
+                    return node[:, k]
+                if dataclasses.is_dataclass(node):
+                    kwargs = {
+                        f.name: split_k(getattr(node, f.name), k)
+                        for f in dataclasses.fields(node)
+                    }
+                    return node.__class__(**kwargs)
+                if isinstance(node, dict):
+                    return {kk: split_k(v, k) for kk, v in node.items()}
+                if isinstance(node, (list, tuple)):
+                    return type(node)([split_k(v, k) for v in node])
+                return node
+
+            return [split_k(gathered, k) for k in range(K)]
+
+        # --------------------------------------------------
+        # Score helper
+        # --------------------------------------------------
+        def score(hyps):
+            if cfg.prune_score == "joint":
+                return torch.stack([h.J for h in hyps], dim=0)
+            else:
+                return torch.stack([h.E for h in hyps], dim=0)
+
+        # --------------------------------------------------
+        # Decide mode
+        # --------------------------------------------------
+        do_global = (cfg.G == 1) or (t_new % cfg.G == 0)
+
+        # ==========================
+        # LOCAL PRUNE
+        # ==========================
+        if not do_global:
+            kept = []
+
+            for group in candidate_groups:
+                S = score(group)             # [C,B]
+                idx = torch.topk(S.T, k=1, dim=1).indices  # [B,1]
+                stacked = stack_list(group)  # [C,B,...]
+                best = gather_bk(stacked, idx)  # length 1 list
+                kept.extend(best)
+
+            return kept
+
+        # ==========================
+        # GLOBAL PRUNE
+        # ==========================
+        all_cands = [c for g in candidate_groups for c in g]
+        S = score(all_cands)                 # [K*C,B]
+        K_eff = min(cfg.K, S.shape[0])
+        idx = torch.topk(S.T, k=K_eff, dim=1).indices  # [B,K]
+        stacked = stack_list(all_cands)
+        return gather_bk(stacked, idx)
