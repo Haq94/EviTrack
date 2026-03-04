@@ -84,7 +84,7 @@ class EviTrackEngine(InferenceEngine):
 
         for b in range(B):
             beam = state.hyps[b]
-            x_tb = x_t[b:b+1]  # [1 dx]
+            x_tb = x_t[b:b+1]  # [1, dx]
 
             # build candidate groups (one list per parent)
             candidate_groups: List[List[Hypothesis]] = []
@@ -159,8 +159,7 @@ class EviTrackEngine(InferenceEngine):
         cfg = self.cfg
 
         x_t1 = x_t.unsqueeze(0) if x_t.ndim == 1 else x_t           # [1, dx]
-        z_prev1 = parent.z_t.unsqueeze(0) if t > 1  else None  # [1, dz] or None
-
+        z_prev1 = parent.z_t if t > 1  else None  # [1, dz] or None
         wm_z_state = parent.wm_z_state
         wm_x_state = parent.wm_x_state
         q_z_state = parent.q_z_state
@@ -221,7 +220,7 @@ class EviTrackEngine(InferenceEngine):
             q_x_state_new = self.proposal.update_x_state(x_t=x_t1, x_state_prev=q_x_state)
 
         return Hypothesis(
-            z_t=z_t1.squeeze(0),          # [dz]
+            z_t=z_t1,          # [1, dz]
             wm_z_state=wm_z_state_new,    # batch=1 state
             wm_x_state=wm_x_state_new,
             q_z_state=q_z_state,
