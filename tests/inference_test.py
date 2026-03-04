@@ -96,7 +96,7 @@ if __name__ == "__main__":
     # -----------------------------
     # Synthetic observations
     # -----------------------------
-    x = generate_synthetic_x(T=12, dx=wm_cfg.dx, B=1, device=DEVICE, dtype=DTYPE, seed=0)
+    x = generate_synthetic_x(T=12, dx=wm_cfg.dx, B=7, device=DEVICE, dtype=DTYPE, seed=0)
 
     # -----------------------------
     # Engines
@@ -107,7 +107,7 @@ if __name__ == "__main__":
             EviTrackEngine(
                 wm=wm,
                 proposal=proposal,
-                cfg=EviTrackConfig(K=4, C=2, tau=1, expand="proposal"),
+                cfg=EviTrackConfig(K=5, C=2, tau=1, expand="proposal"),
             ),
         ),
         (

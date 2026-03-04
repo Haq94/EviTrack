@@ -27,19 +27,19 @@ class StepStats:
 
 @dataclass
 class Hypothesis:
-    # minimal hypothesis state for EviTrack
-    z_t: Tensor              # [B, dz]
-    wm_z_state: Any          # whatever WM uses
+    # single-example hypothesis
+    z_t: Tensor              # [dz]
+    wm_z_state: Any          # WM state for batch=1
     wm_x_state: Any
-    q_z_state: Any
+    q_z_state: Any           # proposal state for batch=1 (or None)
     q_x_state: Any
-    # scores accumulated up to current t
-    J: Tensor                # [B] (joint score)
-    E: Tensor                # [B] (evidence score)
+    J: Tensor                # scalar tensor
+    E: Tensor                # scalar tensor
 
 @dataclass
 class EviTrackState:
-    hyps: List[Hypothesis]
+    # hyps[b] is the beam (list of hypotheses) for example b
+    hyps: List[List[Hypothesis]]
     t: int
     cost: CostCounter
 
