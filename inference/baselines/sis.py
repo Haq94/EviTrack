@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from ..base import InferenceEngine
+from ..utils import normalize_logweights
 from ..types import Particle, ParticleState, StepStats, CostCounter
 
 Tensor = torch.Tensor

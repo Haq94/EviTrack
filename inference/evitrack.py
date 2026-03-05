@@ -53,7 +53,7 @@ class EviTrackEngine(InferenceEngine):
             q_x_state = q_x_state_B[b:b+1] if q_x_state_B is not None else None
 
             # root has no z yet; keep a dummy z0
-            z0 = torch.zeros((dz,), device=device, dtype=dtype)
+            z0 = torch.zeros((1,dz), device=device, dtype=dtype)
             J0 = torch.zeros((), device=device, dtype=dtype)  # scalar
             E0 = torch.zeros((), device=device, dtype=dtype)
 
@@ -74,7 +74,6 @@ class EviTrackEngine(InferenceEngine):
         """
         x_t: [B, dx]
         """
-        cfg = self.cfg
         B = x_t.shape[0]
         t_new = state.t + 1
 
@@ -83,32 +82,15 @@ class EviTrackEngine(InferenceEngine):
         total_kept = 0
 
         for b in range(B):
-            beam = state.hyps[b]
-            x_tb = x_t[b:b+1]  # [1, dx]
-
-            # build candidate groups (one list per parent)
-            candidate_groups: List[List[Hypothesis]] = []
-
-            if t_new == 1:
-                # initialize beam with K children from the root
-                root = beam[0]
-                group = [self._expand_one(root, x_tb, t_new) for _ in range(cfg.K)]
-                candidate_groups = [group]
-            else:
-                for parent in beam:
-                    group = [self._expand_one(parent, x_tb, t_new) for _ in range(cfg.C)]
-                    candidate_groups.append(group)
-
-            total_candidates += sum(len(g) for g in candidate_groups)
-
-            do_prune = (t_new % cfg.tau == 0)
-            if do_prune:
-                kept = self.prune(t_new=t_new, candidate_groups=candidate_groups)
-            else:
-                kept = [c for g in candidate_groups for c in g]
-
-            total_kept += len(kept)
-            new_hyps.append(kept)
+            kept_b, cand_b = self._step_one(
+                beam=state.hyps[b],
+                x_tb=x_t[b:b+1],      # [1, dx]
+                t_new=t_new,
+                cost=state.cost,      # global counter (counts all batch elems)
+            )
+            new_hyps.append(kept_b)
+            total_candidates += cand_b
+            total_kept += len(kept_b)
 
         state.hyps = new_hyps
         state.t = t_new
@@ -121,6 +103,46 @@ class EviTrackEngine(InferenceEngine):
             extra={"B": B},
         )
         return state, stats
+    
+    def _step_one(
+        self,
+        *,
+        beam: List[Hypothesis],
+        x_tb: Tensor,        # [1, dx]
+        t_new: int,
+        cost: CostCounter,
+        ) -> Tuple[List[Hypothesis], int]:
+        """
+        Advances a single batch element (one sequence) by one time step.
+
+        Returns:
+        kept: List[Hypothesis] (new beam for this example)
+        num_candidates: int
+        """
+        cfg = self.cfg
+
+        # build candidate groups (one list per parent)
+        candidate_groups: List[List[Hypothesis]] = []
+
+        if t_new == 1:
+            root = beam[0]
+            group = [self._expand_one(root, x_tb, t_new, cost=cost) for _ in range(cfg.K)]
+            candidate_groups = [group]
+        else:
+            for parent in beam:
+                group = [self._expand_one(parent, x_tb, t_new, cost=cost) for _ in range(cfg.C)]
+                candidate_groups.append(group)
+
+        num_candidates = sum(len(g) for g in candidate_groups)
+
+        # NOTE: remove tau logic later if you want no prune delay.
+        do_prune = (t_new % cfg.tau == 0)
+        if do_prune:
+            kept = self.prune(t_new=t_new, candidate_groups=candidate_groups)
+        else:
+            kept = [c for g in candidate_groups for c in g]
+
+        return kept, num_candidates
 
     def get_mixture(self, state: EviTrackState):
         """
@@ -149,85 +171,205 @@ class EviTrackEngine(InferenceEngine):
     # ------------------------
     # internal: expand a single child
     # ------------------------
-    def _expand_one(self, parent: Hypothesis, x_t: Tensor, t: int) -> Hypothesis:
+    def _expand_one(
+        self,
+        parent: Hypothesis,
+        x_t: Tensor,
+        t: int,
+        *,
+        cost: CostCounter,
+        ) -> Hypothesis:
         """
-        Single-example expansion.
-        x_t: [1, dx]
-        parent.z_t: [dz]
-        Internally we call WM/proposal with batch=1 tensors.
+        Expand one hypothesis (B=1) at time t by sampling z_t, scoring with x_t,
+        updating WM/proposal states, and returning a new Hypothesis.
+
+        Sampling rule (per your intent):
+        - expand="proposal": use proposal for all t (including t==1).
+        - expand="transition": use prior for t==1, transition for t>1.
+
+        Scoring:
+        - evidence: accumulates log p(x_t | z_t, x_<t)
+        - joint:    evidence + log p(z_t | z_{t-1}) (or log p(z1))
         """
+
         cfg = self.cfg
+        assert x_t.shape[0] == 1, "EviTrack _expand_one expects batch=1 tensor [1, dx]"
 
-        x_t1 = x_t.unsqueeze(0) if x_t.ndim == 1 else x_t           # [1, dx]
-        z_prev1 = parent.z_t if t > 1  else None  # [1, dz] or None
-        wm_z_state = parent.wm_z_state
-        wm_x_state = parent.wm_x_state
-        q_z_state = parent.q_z_state
-        q_x_state = parent.q_x_state
+        # --- unpack parent ---
+        z_prev = parent.z_t                  # [1, dz] (dummy z0 for t==1 is OK)
+        wm_z_state_prev = parent.wm_z_state  # None (Markov) or GRU state (NonMarkov)
+        wm_x_state_prev = parent.wm_x_state  # None/markov/memory state
+        q_z_state_prev = parent.q_z_state    # None (z_mode=markov) or GRU state
+        q_x_state_prev = parent.q_x_state    # None/markov/memory state
 
-        # 1) Sample z_t (batch=1)
-        if t == 1:
-            if cfg.expand == "proposal":
-                q_out = self.proposal.propose(
-                    B=1,
-                    z_prev=None,
-                    z_state_prev=q_z_state,
-                    x_state_prev=q_x_state,
-                    device=x_t1.device,
-                    dtype=x_t1.dtype,
-                )
-                z_t1 = q_out["z_t"]              # [1, dz]
-                q_z_state = q_out["z_state_t"]
-            else:
-                z_t1 = self.wm.sample_z1(1, device=x_t1.device, dtype=x_t1.dtype)
+        J_prev = parent.J
+        E_prev = parent.E
 
-            logpzt1 = self.wm.log_prob_z1(z_t1)  # [1]
+        # ---------------------------------------------------
+        # 1) Sample z_t
+        # ---------------------------------------------------
+        if cfg.expand == "proposal":
+            # Proposal: forecasting-causal, depends only on x_{<t} via q_x_state_prev
+            cost.add_proposal(1)
+            q_out = self.proposal.propose(
+                B=1,
+                z_prev=None if t == 1 else z_prev,      # proposal supports z_prev=None at t==1 :contentReference[oaicite:7]{index=7}
+                z_state_prev=q_z_state_prev,
+                x_state_prev=q_x_state_prev,
+                device=x_t.device,
+                dtype=x_t.dtype,
+            )
+            z_t = q_out["z_t"]                 # [1, dz]
+            q_z_state_t = q_out["z_state_t"]   # updated AFTER sampling z_t (if memory) :contentReference[oaicite:8]{index=8}
+
         else:
-            if cfg.expand == "transition":
-                trans_params = self.wm.transition_params(z_prev=z_prev1, z_state_prev=wm_z_state)
-                z_t1 = self.wm.sample_transition(trans_params)
-                logpzt1 = self.wm.log_prob_transition(z_t1, trans_params)
+            # Transition expansion: prior at t==1, transition at t>1
+            if t == 1:
+                cost.add_transition(1)
+                z_t = self.wm.sample_z1(1, device=x_t.device, dtype=x_t.dtype)  # :contentReference[oaicite:9]{index=9}
             else:
-                q_out = self.proposal.propose(
-                    B=1,
-                    z_prev=z_prev1,
-                    z_state_prev=q_z_state,
-                    x_state_prev=q_x_state,
-                    device=x_t1.device,
-                    dtype=x_t1.dtype,
-                )
-                z_t1 = q_out["z_t"]
-                q_z_state = q_out["z_state_t"]
+                cost.add_transition(1)
+                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev)  # :contentReference[oaicite:10]{index=10}
+                z_t = self.wm.sample_transition(trans_params)  # :contentReference[oaicite:11]{index=11}
 
-                trans_params = self.wm.transition_params(z_prev=z_prev1, z_state_prev=wm_z_state)
-                logpzt1 = self.wm.log_prob_transition(z_t1, trans_params)
+            # proposal z-state doesn't change if we didn't use proposal to sample
+            q_z_state_t = q_z_state_prev
 
-        # 2) Emission likelihood
-        z_state_curr = self.wm.z_state_curr(wm_z_state, z_t1)
-        emit_params = self.wm.emission_params(z_state_curr=z_state_curr, x_state_prev=wm_x_state)
-        logpxt1 = self.wm.log_prob_emission(x_t1, emit_params)  # [1]
+        # ---------------------------------------------------
+        # 2) Joint latent term log p(z_t | ...)
+        # ---------------------------------------------------
+        if t == 1:
+            # Always model prior for joint term
+            cost.add_transition(1)
+            logpzt = self.wm.log_prob_z1(z_t)  
+        else:
+            # Always model transition for joint term (even if sampled from proposal)
+            cost.add_transition(1)
+            trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev) 
+            logpzt = self.wm.log_prob_transition(z_t, trans_params)  
 
-        # 3) Update accumulated scores (scalars)
-        E_new = parent.E + logpxt1.squeeze(0)
-        J_new = parent.J + (logpxt1 + logpzt1).squeeze(0)
+        # ---------------------------------------------------
+        # 3) Emission likelihood log p(x_t | z_state_curr, x_state_prev)
+        # ---------------------------------------------------
+        cost.add_emission(1)
+        z_state_curr = self.wm.z_state_curr(wm_z_state_prev, z_t)  # Markov: z_t; NonMarkov: GRU(z_state_prev,z_t) 
+        emit_params = self.wm.emission_params(z_state_curr=z_state_curr, x_state_prev=wm_x_state_prev)  
+        logpxt = self.wm.log_prob_emission(x_t, emit_params)  
 
-        # 4) Update stored states AFTER using x_t
-        wm_z_state_new = self.wm.update_z_state(wm_z_state, z_t1)
-        wm_x_state_new = self.wm.update_x_state(wm_x_state, x_t1)
+        # ---------------------------------------------------
+        # 4) Accumulate scores
+        # ---------------------------------------------------
+        E_t = E_prev + logpxt.squeeze()
+        J_t = J_prev + (logpxt + logpzt).squeeze()
 
-        q_x_state_new = None
+        # ---------------------------------------------------
+        # 5) Update stored WM states AFTER observing (z_t, x_t)
+        # ---------------------------------------------------
+        # Note: Markov WM returns None for z_state_t by default; NonMarkov updates GRU state 
+        wm_z_state_t = self.wm.update_z_state(wm_z_state_prev, z_t)  
+        wm_x_state_t = self.wm.update_x_state(wm_x_state_prev, x_t)  
+
+        # ---------------------------------------------------
+        # 6) Update proposal x-state AFTER observing x_t (forecasting-causal)
+        # ---------------------------------------------------
         if self.proposal is not None:
-            q_x_state_new = self.proposal.update_x_state(x_t=x_t1, x_state_prev=q_x_state)
+            q_x_state_t = self.proposal.update_x_state(x_t, q_x_state_prev)  # :contentReference[oaicite:21]{index=21}
+        else:
+            q_x_state_t = None
 
+        # ---------------------------------------------------
+        # 7) Return child hypothesis
+        # ---------------------------------------------------
         return Hypothesis(
-            z_t=z_t1,          # [1, dz]
-            wm_z_state=wm_z_state_new,    # batch=1 state
-            wm_x_state=wm_x_state_new,
-            q_z_state=q_z_state,
-            q_x_state=q_x_state_new,
-            J=J_new,
-            E=E_new,
+            z_t=z_t,
+            wm_z_state=wm_z_state_t,
+            wm_x_state=wm_x_state_t,
+            q_z_state=q_z_state_t,
+            q_x_state=q_x_state_t,
+            J=J_t,
+            E=E_t,
         )
+
+
+    # def _expand_one(self, parent: Hypothesis, x_t: Tensor, t: int) -> Hypothesis:
+    #     """
+    #     Single-example expansion.
+    #     x_t: [1, dx]
+    #     parent.z_t: [dz]
+    #     Internally we call WM/proposal with batch=1 tensors.
+    #     """
+    #     cfg = self.cfg
+
+    #     x_t1 = x_t.unsqueeze(0) if x_t.ndim == 1 else x_t           # [1, dx]
+    #     z_prev1 = parent.z_t if t > 1  else None  # [1, dz] or None
+    #     wm_z_state = parent.wm_z_state
+    #     wm_x_state = parent.wm_x_state
+    #     q_z_state = parent.q_z_state
+    #     q_x_state = parent.q_x_state
+
+    #     # 1) Sample z_t (batch=1)
+    #     if t == 1:
+    #         if cfg.expand == "proposal":
+    #             q_out = self.proposal.propose(
+    #                 B=1,
+    #                 z_prev=None,
+    #                 z_state_prev=q_z_state,
+    #                 x_state_prev=q_x_state,
+    #                 device=x_t1.device,
+    #                 dtype=x_t1.dtype,
+    #             )
+    #             z_t1 = q_out["z_t"]              # [1, dz]
+    #             q_z_state = q_out["z_state_t"]
+    #         else:
+    #             z_t1 = self.wm.sample_z1(1, device=x_t1.device, dtype=x_t1.dtype)
+
+    #         logpzt1 = self.wm.log_prob_z1(z_t1)  # [1]
+    #     else:
+    #         if cfg.expand == "transition":
+    #             trans_params = self.wm.transition_params(z_prev=z_prev1, z_state_prev=wm_z_state)
+    #             z_t1 = self.wm.sample_transition(trans_params)
+    #             logpzt1 = self.wm.log_prob_transition(z_t1, trans_params)
+    #         else:
+    #             q_out = self.proposal.propose(
+    #                 B=1,
+    #                 z_prev=z_prev1,
+    #                 z_state_prev=q_z_state,
+    #                 x_state_prev=q_x_state,
+    #                 device=x_t1.device,
+    #                 dtype=x_t1.dtype,
+    #             )
+    #             z_t1 = q_out["z_t"]
+    #             q_z_state = q_out["z_state_t"]
+
+    #             trans_params = self.wm.transition_params(z_prev=z_prev1, z_state_prev=wm_z_state)
+    #             logpzt1 = self.wm.log_prob_transition(z_t1, trans_params)
+
+    #     # 2) Emission likelihood
+    #     z_state_curr = self.wm.z_state_curr(wm_z_state, z_t1)
+    #     emit_params = self.wm.emission_params(z_state_curr=z_state_curr, x_state_prev=wm_x_state)
+    #     logpxt1 = self.wm.log_prob_emission(x_t1, emit_params)  # [1]
+
+    #     # 3) Update accumulated scores (scalars)
+    #     E_new = parent.E + logpxt1.squeeze(0)
+    #     J_new = parent.J + (logpxt1 + logpzt1).squeeze(0)
+
+    #     # 4) Update stored states AFTER using x_t
+    #     wm_z_state_new = self.wm.update_z_state(wm_z_state, z_t1)
+    #     wm_x_state_new = self.wm.update_x_state(wm_x_state, x_t1)
+
+    #     q_x_state_new = None
+    #     if self.proposal is not None:
+    #         q_x_state_new = self.proposal.update_x_state(x_t=x_t1, x_state_prev=q_x_state)
+
+    #     return Hypothesis(
+    #         z_t=z_t1,          # [1, dz]
+    #         wm_z_state=wm_z_state_new,    # batch=1 state
+    #         wm_x_state=wm_x_state_new,
+    #         q_z_state=q_z_state,
+    #         q_x_state=q_x_state_new,
+    #         J=J_new,
+    #         E=E_new,
+    #     )
     
     # ------------------------
     # internal: pruning
@@ -244,7 +386,7 @@ class EviTrackEngine(InferenceEngine):
         flatten all children and keep top-K
         """
         cfg = self.cfg
-        do_global = (cfg.G == 1) or (t_new % cfg.G == 0)
+        do_global = (t_new == 1) or (t_new % cfg.G == 0)
 
         def get_score(h: Hypothesis) -> Tensor:
             return h.J if cfg.prune_score == "joint" else h.E

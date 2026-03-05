@@ -107,7 +107,7 @@ if __name__ == "__main__":
             EviTrackEngine(
                 wm=wm,
                 proposal=proposal,
-                cfg=EviTrackConfig(K=5, C=2, tau=1, expand="proposal"),
+                cfg=EviTrackConfig(K=5, G=3, C=2, tau=1, expand="proposal"),
             ),
         ),
         (
