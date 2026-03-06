@@ -45,15 +45,17 @@ class EviTrackState:
 
 @dataclass
 class Particle:
-    z_t: Tensor
-    wm_z_state: Any
+    # single-example particle
+    z_t: Tensor              # [1, dz]
+    wm_z_state: Any          # WM state for batch=1
     wm_x_state: Any
     q_z_state: Any
     q_x_state: Any
-    logw: Tensor             # [B] or [B,] per particle
+    logw: Tensor             # scalar tensor
 
 @dataclass
 class ParticleState:
-    particles: List[Particle]
+    # particles[b] is the particle set (list of particles) for example b
+    particles: List[List[Particle]]
     t: int
     cost: CostCounter

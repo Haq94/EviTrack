@@ -221,16 +221,15 @@ class EviTrackEngine(InferenceEngine):
             )
             z_t = q_out["z_t"]                 # [1, dz]
             q_z_state_t = q_out["z_state_t"]   # updated AFTER sampling z_t (if memory) :contentReference[oaicite:8]{index=8}
-
+            trans_params = None                # Needed for accurate counter book keeping
         else:
             # Transition expansion: prior at t==1, transition at t>1
             if t == 1:
-                cost.add_transition(1)
-                z_t = self.wm.sample_z1(1, device=x_t.device, dtype=x_t.dtype)  # :contentReference[oaicite:9]{index=9}
+                z_t = self.wm.sample_z1(1, device=x_t.device, dtype=x_t.dtype)  
             else:
                 cost.add_transition(1)
-                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev)  # :contentReference[oaicite:10]{index=10}
-                z_t = self.wm.sample_transition(trans_params)  # :contentReference[oaicite:11]{index=11}
+                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev)  
+                z_t = self.wm.sample_transition(trans_params)  
 
             # proposal z-state doesn't change if we didn't use proposal to sample
             q_z_state_t = q_z_state_prev
@@ -240,12 +239,12 @@ class EviTrackEngine(InferenceEngine):
         # ---------------------------------------------------
         if t == 1:
             # Always model prior for joint term
-            cost.add_transition(1)
             logpzt = self.wm.log_prob_z1(z_t)  
         else:
-            # Always model transition for joint term (even if sampled from proposal)
-            cost.add_transition(1)
-            trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev) 
+            if trans_params is None:
+                # Always model transition for joint term (even if sampled from proposal)
+                cost.add_transition(1)
+                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev) 
             logpzt = self.wm.log_prob_transition(z_t, trans_params)  
 
         # ---------------------------------------------------
@@ -273,7 +272,7 @@ class EviTrackEngine(InferenceEngine):
         # 6) Update proposal x-state AFTER observing x_t (forecasting-causal)
         # ---------------------------------------------------
         if self.proposal is not None:
-            q_x_state_t = self.proposal.update_x_state(x_t, q_x_state_prev)  # :contentReference[oaicite:21]{index=21}
+            q_x_state_t = self.proposal.update_x_state(x_t, q_x_state_prev)
         else:
             q_x_state_t = None
 
@@ -289,87 +288,6 @@ class EviTrackEngine(InferenceEngine):
             J=J_t,
             E=E_t,
         )
-
-
-    # def _expand_one(self, parent: Hypothesis, x_t: Tensor, t: int) -> Hypothesis:
-    #     """
-    #     Single-example expansion.
-    #     x_t: [1, dx]
-    #     parent.z_t: [dz]
-    #     Internally we call WM/proposal with batch=1 tensors.
-    #     """
-    #     cfg = self.cfg
-
-    #     x_t1 = x_t.unsqueeze(0) if x_t.ndim == 1 else x_t           # [1, dx]
-    #     z_prev1 = parent.z_t if t > 1  else None  # [1, dz] or None
-    #     wm_z_state = parent.wm_z_state
-    #     wm_x_state = parent.wm_x_state
-    #     q_z_state = parent.q_z_state
-    #     q_x_state = parent.q_x_state
-
-    #     # 1) Sample z_t (batch=1)
-    #     if t == 1:
-    #         if cfg.expand == "proposal":
-    #             q_out = self.proposal.propose(
-    #                 B=1,
-    #                 z_prev=None,
-    #                 z_state_prev=q_z_state,
-    #                 x_state_prev=q_x_state,
-    #                 device=x_t1.device,
-    #                 dtype=x_t1.dtype,
-    #             )
-    #             z_t1 = q_out["z_t"]              # [1, dz]
-    #             q_z_state = q_out["z_state_t"]
-    #         else:
-    #             z_t1 = self.wm.sample_z1(1, device=x_t1.device, dtype=x_t1.dtype)
-
-    #         logpzt1 = self.wm.log_prob_z1(z_t1)  # [1]
-    #     else:
-    #         if cfg.expand == "transition":
-    #             trans_params = self.wm.transition_params(z_prev=z_prev1, z_state_prev=wm_z_state)
-    #             z_t1 = self.wm.sample_transition(trans_params)
-    #             logpzt1 = self.wm.log_prob_transition(z_t1, trans_params)
-    #         else:
-    #             q_out = self.proposal.propose(
-    #                 B=1,
-    #                 z_prev=z_prev1,
-    #                 z_state_prev=q_z_state,
-    #                 x_state_prev=q_x_state,
-    #                 device=x_t1.device,
-    #                 dtype=x_t1.dtype,
-    #             )
-    #             z_t1 = q_out["z_t"]
-    #             q_z_state = q_out["z_state_t"]
-
-    #             trans_params = self.wm.transition_params(z_prev=z_prev1, z_state_prev=wm_z_state)
-    #             logpzt1 = self.wm.log_prob_transition(z_t1, trans_params)
-
-    #     # 2) Emission likelihood
-    #     z_state_curr = self.wm.z_state_curr(wm_z_state, z_t1)
-    #     emit_params = self.wm.emission_params(z_state_curr=z_state_curr, x_state_prev=wm_x_state)
-    #     logpxt1 = self.wm.log_prob_emission(x_t1, emit_params)  # [1]
-
-    #     # 3) Update accumulated scores (scalars)
-    #     E_new = parent.E + logpxt1.squeeze(0)
-    #     J_new = parent.J + (logpxt1 + logpzt1).squeeze(0)
-
-    #     # 4) Update stored states AFTER using x_t
-    #     wm_z_state_new = self.wm.update_z_state(wm_z_state, z_t1)
-    #     wm_x_state_new = self.wm.update_x_state(wm_x_state, x_t1)
-
-    #     q_x_state_new = None
-    #     if self.proposal is not None:
-    #         q_x_state_new = self.proposal.update_x_state(x_t=x_t1, x_state_prev=q_x_state)
-
-    #     return Hypothesis(
-    #         z_t=z_t1,          # [1, dz]
-    #         wm_z_state=wm_z_state_new,    # batch=1 state
-    #         wm_x_state=wm_x_state_new,
-    #         q_z_state=q_z_state,
-    #         q_x_state=q_x_state_new,
-    #         J=J_new,
-    #         E=E_new,
-    #     )
     
     # ------------------------
     # internal: pruning
