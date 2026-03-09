@@ -12,23 +12,41 @@ from .utils import topk_per_batch, stack_scores, normalize_logweights
 Tensor = torch.Tensor
 
 
+# @dataclass
+# class EviTrackConfig:
+#     K: int
+#     C: int
+#     tau: int = 1
+#     G: int = 1                 # every G steps do GLOBAL prune; otherwise LOCAL prune
+#     local_keep: Optional[int] = None  # how many children to keep per parent during LOCAL prune (<= C). default: min(C,K)
+#     expand: str = "proposal"   # "proposal" or "transition"
+#     prune_score: str = "evidence"  # "evidence" or "joint"
+#     weight_mode: str = "evidence"   # "evidence" or "joint"
+
 @dataclass
 class EviTrackConfig:
     K: int
     C: int
     tau: int = 1
-    G: int = 1                 # every G steps do GLOBAL prune; otherwise LOCAL prune
-    local_keep: Optional[int] = None  # how many children to keep per parent during LOCAL prune (<= C). default: min(C,K)
-    expand: str = "proposal"   # "proposal" or "transition"
-    prune_score: str = "evidence"  # "evidence" or "joint"
-    weight_mode: str = "evidence"   # "evidence" or "joint"
+    G: int = 1
+    expand: str = "proposal"      # "proposal" or "transition"
+
+    # scoring used for pruning
+    prune_score: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
+
+    # scoring used for predictive mixture weights
+    weight_mode: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
+
+    # background latent random-walk std for TBD score
+    sigma_bg: float = 1.0
 
 class EviTrackEngine(InferenceEngine):
     def __init__(self, *, wm, proposal, cfg: EviTrackConfig):
         super().__init__(wm=wm, proposal=proposal, cfg=cfg)
         assert cfg.expand in ("proposal", "transition")
-        assert cfg.prune_score in ("evidence", "joint")
-        assert cfg.weight_mode in ("evidence", "joint")
+        assert cfg.prune_score in ("evidence", "joint", "tbd_joint")
+        assert cfg.weight_mode in ("evidence", "joint", "tbd_joint")
+        assert cfg.sigma_bg > 0.0, "sigma_bg must be positive."
         if cfg.expand == "proposal":
             assert proposal is not None, "proposal required for expand='proposal'"
 
@@ -56,6 +74,7 @@ class EviTrackEngine(InferenceEngine):
             z0 = torch.zeros((1,dz), device=device, dtype=dtype)
             J0 = torch.zeros((), device=device, dtype=dtype)  # scalar
             E0 = torch.zeros((), device=device, dtype=dtype)
+            J_tbd0 = torch.zeros((), device=device, dtype=dtype)
 
             h0 = Hypothesis(
                 z_t=z0,
@@ -65,6 +84,7 @@ class EviTrackEngine(InferenceEngine):
                 q_x_state=q_x_state,
                 J=J0,
                 E=E0,
+                J_tbd=J_tbd0,
             )
             hyps.append([h0])  # beam for example b
 
@@ -163,7 +183,14 @@ class EviTrackEngine(InferenceEngine):
         for b in range(B):
             for k in range(K):
                 h = state.hyps[b][k]
-                logw[b, k] = h.J if cfg.weight_mode == "joint" else h.E
+                if cfg.weight_mode == "joint":
+                    logw[b, k] = h.J
+                elif cfg.weight_mode == "evidence":
+                    logw[b, k] = h.E
+                elif cfg.weight_mode == "tbd_joint":
+                    logw[b, k] = h.J_tbd
+                else:
+                    raise ValueError(f"Unknown weight_mode={cfg.weight_mode}")
 
         w = normalize_logweights(logw, dim=1)  # normalize over k
         return w, state.hyps
@@ -204,6 +231,7 @@ class EviTrackEngine(InferenceEngine):
 
         J_prev = parent.J
         E_prev = parent.E
+        J_tbd_prev = parent.J_tbd
 
         # ---------------------------------------------------
         # 1) Sample z_t
@@ -261,6 +289,13 @@ class EviTrackEngine(InferenceEngine):
         E_t = E_prev + logpxt.squeeze()
         J_t = J_prev + (logpxt + logpzt).squeeze()
 
+        if t == 1:
+            logp_bg_z1 = self._log_prob_bg_initial(z_t)
+            J_tbd = J_tbd_prev + (logpxt + logpzt - logp_bg_z1).squeeze()
+        else:
+            logp_bg_zt = self._log_prob_bg_transition(z_t, z_prev)  # [1]
+            J_tbd = J_tbd_prev + (logpxt + logpzt - logp_bg_zt).squeeze()
+
         # ---------------------------------------------------
         # 5) Update stored WM states AFTER observing (z_t, x_t)
         # ---------------------------------------------------
@@ -287,6 +322,7 @@ class EviTrackEngine(InferenceEngine):
             q_x_state=q_x_state_t,
             J=J_t,
             E=E_t,
+            J_tbd=J_tbd,
         )
     
     # ------------------------
@@ -307,7 +343,13 @@ class EviTrackEngine(InferenceEngine):
         do_global = (t_new == 1) or (t_new % cfg.G == 0)
 
         def get_score(h: Hypothesis) -> Tensor:
-            return h.J if cfg.prune_score == "joint" else h.E
+            if cfg.prune_score == "joint":
+                return h.J
+            if cfg.prune_score == "evidence":
+                return h.E
+            if cfg.prune_score == "tbd_joint":
+                return h.J_tbd
+            raise ValueError(f"Unknown prune_score={cfg.prune_score}")
 
         if do_global:
             all_cands = [c for g in candidate_groups for c in g]
@@ -323,3 +365,39 @@ class EviTrackEngine(InferenceEngine):
             best = int(torch.argmax(scores).item())
             kept.append(g[best])
         return kept
+    
+    def _log_prob_bg_initial(self, z_1: Tensor) -> Tensor:
+        sigma = float(self.cfg.sigma_bg)
+        dz = z_1.shape[-1]
+        sq = torch.sum(z_1 * z_1, dim=-1)
+        log_norm = dz * torch.log(
+            torch.tensor(2.0 * torch.pi * sigma * sigma, device=z_1.device, dtype=z_1.dtype)
+        )
+        return -0.5 * (sq / (sigma * sigma) + log_norm)
+    
+    def _log_prob_bg_transition(
+        self,
+        z_t: Tensor,
+        z_prev: Tensor,
+        ) -> Tensor:
+        """
+        Background latent dynamics:
+            p_bg(z_t | z_{t-1}) = N(z_{t-1}, sigma_bg^2 I)
+
+        Args:
+            z_t:    [1, dz]
+            z_prev: [1, dz]
+
+        Returns:
+            logp_bg: [1]
+        """
+        sigma = float(self.cfg.sigma_bg)
+        dz = z_t.shape[-1]
+
+        diff = z_t - z_prev
+        sq = torch.sum(diff * diff, dim=-1)  # [1]
+
+        log_norm = dz * torch.log(
+            torch.tensor(2.0 * torch.pi * sigma * sigma, device=z_t.device, dtype=z_t.dtype)
+        )
+        return -0.5 * (sq / (sigma * sigma) + log_norm)

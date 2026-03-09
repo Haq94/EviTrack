@@ -7,6 +7,7 @@ from world_model.markov import MarkovWorldModel
 from proposal import Proposal, ProposalConfig
 
 from inference.evitrack import EviTrackEngine, EviTrackConfig
+from inference.baselines.random_beam import RandomBeamEngine, RandomBeamConfig
 from inference.baselines.smc import SMCEngine, SMCConfig
 from inference.baselines.bpf import BFPEngine, BPFConfig
 from inference.baselines.sis import SISEngine
@@ -146,6 +147,42 @@ def main():
                 wm=wm,
                 proposal=proposal,
                 cfg=EviTrackConfig(K=5, G=3, C=2, tau=1, expand="proposal"),
+            ),
+            "B": 7,
+            "alias_check": False,
+        },
+        {
+            "name": "EviTrack(TBD-joint)",
+            "engine": EviTrackEngine(
+                wm=wm,
+                proposal=proposal,
+                cfg=EviTrackConfig(
+                    K=5,
+                    G=3,
+                    C=2,
+                    tau=1,
+                    expand="proposal",
+                    prune_score="tbd_joint",
+                    weight_mode="tbd_joint",
+                    sigma_bg=2.0,
+                ),
+            ),
+            "B": 7,
+            "alias_check": False,
+        },
+        {
+            "name": "RandomBeam(proposal-expand)",
+            "engine": RandomBeamEngine(
+                wm=wm,
+                proposal=proposal,
+                cfg=RandomBeamConfig(
+                    K=5,
+                    G=3,
+                    C=2,
+                    tau=1,
+                    expand="proposal",
+                    replace=False,
+                ),
             ),
             "B": 7,
             "alias_check": False,

@@ -28,13 +28,14 @@ class StepStats:
 @dataclass
 class Hypothesis:
     # single-example hypothesis
-    z_t: Tensor              # [dz]
+    z_t: Tensor              # [1, dz]
     wm_z_state: Any          # WM state for batch=1
     wm_x_state: Any
     q_z_state: Any           # proposal state for batch=1 (or None)
     q_x_state: Any
     J: Tensor                # scalar tensor
     E: Tensor                # scalar tensor
+    J_tbd: torch.Tensor      # scalar score 
 
 @dataclass
 class EviTrackState:
