@@ -274,6 +274,8 @@ def build_synthetic_bundle(
             seed=seed + seed_offset,
             return_logp=False,
             extras=extras,
+            device=device,
+            dtype=dtype,
         )
         x = batch.x
         z = batch.z
