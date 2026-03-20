@@ -81,7 +81,7 @@ class AnalyticalWorldModel(MarkovWorldModel):
         super().__init__(cfg)
 
         # ---- prior: overwrite learned parameters with fixed analytic values ----
-        # base.py stores prior_mu/prior_logstd as Parameters【turn27file10†base.py†L76-L79】
+        # base.py stores prior_mu/prior_logstd as Parameter
         with torch.no_grad():
             self.prior_mu.copy_(prior_mu0.reshape(-1))
             diag0 = torch.diagonal(prior_cov0, dim1=-2, dim2=-1).reshape(-1)

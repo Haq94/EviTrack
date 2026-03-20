@@ -31,11 +31,16 @@ class BaseExperiment:
       - its inference evaluation
     """
 
-    def __init__(self, *, name: str, run_root: str = "results", seed: int = 0):
+    def __init__(self, *, name: str, run_root: str = "results", seed: int = 0, use_seed_dir: bool = True):
         self.name = name
         self.run_root = Path(run_root)
         self.seed = int(seed)
-        self.run_dir = self.run_root / self.name / f"seed_{self.seed:03d}"
+
+        if use_seed_dir:
+            self.run_dir = self.run_root / self.name / f"seed_{self.seed:03d}"
+        else:
+            self.run_dir = self.run_root / self.name
+
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
     def save_json(self, path: Path, data: Dict[str, Any]) -> None:

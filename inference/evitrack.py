@@ -29,7 +29,7 @@ class EviTrackConfig:
     C: int
     tau: int = 1
     G: int = 1
-    expand: str = "proposal"      # "proposal" or "transition"
+    expand: str = "transition"      # "proposal" or "transition"
 
     # scoring used for pruning
     prune_score: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
@@ -123,7 +123,7 @@ class EviTrackEngine(InferenceEngine):
             extra={"B": B},
         )
         return state, stats
-    
+
     def _step_one(
         self,
         *,
@@ -253,11 +253,11 @@ class EviTrackEngine(InferenceEngine):
         else:
             # Transition expansion: prior at t==1, transition at t>1
             if t == 1:
-                z_t = self.wm.sample_z1(1, device=x_t.device, dtype=x_t.dtype)  
+                z_t = self.wm.sample_z1(1, device=x_t.device, dtype=x_t.dtype)
             else:
                 cost.add_transition(1)
-                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev)  
-                z_t = self.wm.sample_transition(trans_params)  
+                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev)
+                z_t = self.wm.sample_transition(trans_params)
 
             # proposal z-state doesn't change if we didn't use proposal to sample
             q_z_state_t = q_z_state_prev
@@ -267,21 +267,21 @@ class EviTrackEngine(InferenceEngine):
         # ---------------------------------------------------
         if t == 1:
             # Always model prior for joint term
-            logpzt = self.wm.log_prob_z1(z_t)  
+            logpzt = self.wm.log_prob_z1(z_t)
         else:
             if trans_params is None:
                 # Always model transition for joint term (even if sampled from proposal)
                 cost.add_transition(1)
-                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev) 
-            logpzt = self.wm.log_prob_transition(z_t, trans_params)  
+                trans_params = self.wm.transition_params(z_prev=z_prev, z_state_prev=wm_z_state_prev)
+            logpzt = self.wm.log_prob_transition(z_t, trans_params)
 
         # ---------------------------------------------------
         # 3) Emission likelihood log p(x_t | z_state_curr, x_state_prev)
         # ---------------------------------------------------
         cost.add_emission(1)
-        z_state_curr = self.wm.z_state_curr(wm_z_state_prev, z_t)  # Markov: z_t; NonMarkov: GRU(z_state_prev,z_t) 
-        emit_params = self.wm.emission_params(z_state_curr=z_state_curr, x_state_prev=wm_x_state_prev)  
-        logpxt = self.wm.log_prob_emission(x_t, emit_params)  
+        z_state_curr = self.wm.z_state_curr(wm_z_state_prev, z_t)  # Markov: z_t; NonMarkov: GRU(z_state_prev,z_t)
+        emit_params = self.wm.emission_params(z_state_curr=z_state_curr, x_state_prev=wm_x_state_prev)
+        logpxt = self.wm.log_prob_emission(x_t, emit_params)
 
         # ---------------------------------------------------
         # 4) Accumulate scores
@@ -299,9 +299,9 @@ class EviTrackEngine(InferenceEngine):
         # ---------------------------------------------------
         # 5) Update stored WM states AFTER observing (z_t, x_t)
         # ---------------------------------------------------
-        # Note: Markov WM returns None for z_state_t by default; NonMarkov updates GRU state 
-        wm_z_state_t = self.wm.update_z_state(wm_z_state_prev, z_t)  
-        wm_x_state_t = self.wm.update_x_state(wm_x_state_prev, x_t)  
+        # Note: Markov WM returns None for z_state_t by default; NonMarkov updates GRU state
+        wm_z_state_t = self.wm.update_z_state(wm_z_state_prev, z_t)
+        wm_x_state_t = self.wm.update_x_state(wm_x_state_prev, x_t)
 
         # ---------------------------------------------------
         # 6) Update proposal x-state AFTER observing x_t (forecasting-causal)
@@ -324,7 +324,7 @@ class EviTrackEngine(InferenceEngine):
             E=E_t,
             J_tbd=J_tbd,
         )
-    
+
     # ------------------------
     # internal: pruning
     # ------------------------
@@ -365,7 +365,7 @@ class EviTrackEngine(InferenceEngine):
             best = int(torch.argmax(scores).item())
             kept.append(g[best])
         return kept
-    
+
     def _log_prob_bg_initial(self, z_1: Tensor) -> Tensor:
         sigma = float(self.cfg.sigma_bg)
         dz = z_1.shape[-1]
@@ -374,7 +374,7 @@ class EviTrackEngine(InferenceEngine):
             torch.tensor(2.0 * torch.pi * sigma * sigma, device=z_1.device, dtype=z_1.dtype)
         )
         return -0.5 * (sq / (sigma * sigma) + log_norm)
-    
+
     def _log_prob_bg_transition(
         self,
         z_t: Tensor,

@@ -102,7 +102,7 @@ def generate_sequences(
     extras = {} if extras is None else dict(extras)
     device = torch.device(device)
 
-    gen = torch.Generator(device="cpu")  # torch.Generator is CPU-backed; that’s fine
+    gen = torch.Generator(device=device)  # torch.Generator is CPU-backed; that's fine
     gen.manual_seed(seed)
 
     mu0_vec = prior.mu0.to(device=device, dtype=dtype)
@@ -189,6 +189,22 @@ class SequenceDataset(Dataset):
         return out
 
 
+class DictDataset(Dataset):
+    """Dataset that stores a dict of tensors and returns dict items."""
+
+    def __init__(self, tensors: Dict[str, Tensor]):
+        lengths = {k: v.shape[0] for k, v in tensors.items()}
+        if len(set(lengths.values())) != 1:
+            raise ValueError(f"All tensors must have the same first dimension; got {lengths}")
+        self.tensors = tensors
+
+    def __len__(self) -> int:
+        return next(iter(self.tensors.values())).shape[0]
+
+    def __getitem__(self, idx: int) -> Dict[str, Tensor]:
+        return {k: v[idx] for k, v in self.tensors.items()}
+
+
 def make_dataloader(
     T: int,
     B: int,
@@ -231,6 +247,29 @@ def make_dataloader(
     return DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
 
 
+def _compute_labels(
+    z: Tensor,
+    label_fns: Dict[str, Callable[[Tensor], Any]],
+    dtype: torch.dtype,
+) -> Dict[str, Tensor]:
+    """
+    Apply per-trajectory label functions to z of shape (B, T, dz).
+    Each fn takes a single trajectory (T, dz) and returns a Python scalar (int or bool).
+    Returns a dict of tensors of shape (B,).
+    """
+    B = z.shape[0]
+    result: Dict[str, Tensor] = {}
+    for key, fn in label_fns.items():
+        vals = [fn(z[i]) for i in range(B)]
+        if isinstance(vals[0], bool):
+            result[key] = torch.tensor(vals, dtype=torch.bool)
+        elif isinstance(vals[0], int):
+            result[key] = torch.tensor(vals, dtype=torch.long)
+        else:
+            result[key] = torch.tensor(vals, dtype=dtype)
+    return result
+
+
 def build_synthetic_bundle(
     *,
     T: int,
@@ -252,11 +291,14 @@ def build_synthetic_bundle(
     include_latents_in_test: bool = True,
     extras: Optional[Dict] = None,
     meta: Optional[Dict[str, Any]] = None,
+    label_fns: Optional[Dict[str, Callable[[Tensor], Any]]] = None,
 ) -> DataBundle:
     """
     Generic builder: from (prior, transition, emission) -> DataBundle(train/val/test).
-    Train batches default to (x,) so Trainer stays unchanged.
-    Val/test can optionally return (x, z) for diagnostics.
+
+    label_fns: optional dict mapping label name -> callable(z_traj: Tensor[T, dz]) -> scalar.
+      Labels are computed per trajectory and included in every split's batch dict under
+      the corresponding key (e.g. "disambiguation_time", "delayed_flag").
     """
     if torch is None or DataLoader is None:
         raise RuntimeError("PyTorch is not available, cannot create DataLoaders.")
@@ -264,7 +306,14 @@ def build_synthetic_bundle(
     if dtype is None:
         dtype = torch.float32
 
-    def _make_loader(N: int, seed_offset: int, *, shuffle: bool, drop_last: bool, include_latents: bool):
+    def _make_loader(
+        N: int,
+        seed_offset: int,
+        *,
+        shuffle: bool,
+        drop_last: bool,
+        include_latents: bool,
+    ) -> DataLoader:
         batch = generate_sequences(
             T=T,
             B=N,
@@ -277,9 +326,14 @@ def build_synthetic_bundle(
             device=device,
             dtype=dtype,
         )
-        x = batch.x
-        z = batch.z
-        ds = TensorDataset(x, z) if include_latents else TensorDataset(x)
+        tensors: Dict[str, Tensor] = {"x": batch.x}
+        if include_latents:
+            tensors["z"] = batch.z
+
+        if label_fns:
+            tensors.update(_compute_labels(batch.z, label_fns, dtype))
+
+        ds = DictDataset(tensors)
         return DataLoader(
             ds,
             batch_size=batch_size,
@@ -302,7 +356,9 @@ def build_synthetic_bundle(
             n_test, 15000, shuffle=False, drop_last=False, include_latents=include_latents_in_test
         )
 
-    train_keys = ("x", "z") if include_latents_in_train else ("x",)
+    # Determine train batch keys from a sample item
+    sample_item = train_loader.dataset[0]
+    train_keys = tuple(sample_item.keys())
 
     return DataBundle(
         train=train_loader,

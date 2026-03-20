@@ -1,202 +1,293 @@
 # experiments/analytical_synthetic_experiment.py
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, Optional
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import torch
 
 from experiments.base_experiment import BaseExperiment
-from experiments.inference_eval import run_online_inference, save_inference_result
+from experiments.inference_eval import run_and_save_inference_states
 
 from world_model import WorldModelConfig
 from world_model.analytical import AnalyticalWorldModel
-from proposal import Proposal, ProposalConfig
 
-from data.synthetic_generator import build_synthetic_bundle
-from data.synthetic_tasks.doublewell_1d import (
-    make_prior,
-    make_transition,
-    make_emission,
+from data.synthetic_tasks.doublewell_1d import make_prior, make_transition, make_emission
+from data.synthetic_tasks.doublewell_1d_dataset import (
+    DoubleWell1DDatasetArtifact,
+    build_doublewell_1d_dataset,
 )
+
+
+# ---------------------------------------------------------------
+# Configs
+# ---------------------------------------------------------------
+
+@dataclass
+class DatasetConfig:
+    """Controls how the fixed benchmark dataset is obtained."""
+
+    # Path to existing artifact (data.pt + metadata.json).
+    # If None and generate=True, dataset is built and saved to a default location.
+    path: Optional[str] = None
+
+    # Generate if not found
+    generate: bool = True
+
+    # Generation parameters
+    T: int = 120
+    n_delayed: int = 25
+    n_non_delayed: int = 25
+    search_seed_start: int = 0
+    max_seed_search: int = 100_000
+
+    # Double-well task parameters
+    a: float = 3.0
+    V: float = 0.06
+    dt: float = 1.0
+    sigma_z: float = 0.05
+    d: float = 2.0
+    n: int = 1
+    sigma_x: float = 0.12
+    z0_mean: float = 0.0
+    z0_std: float = 1.0
+
+    # Quadrature disambiguation detection
+    threshold: float = 0.8
+    zmin: float = -4.0
+    zmax: float = 4.0
+    G: int = 1000
 
 
 @dataclass
 class AnalyticalSyntheticConfig:
-    experiment_name: str
+    experiment_name: str = "doublewell_analytical"
     run_root: str = "results"
     seed: int = 0
     device: str = "cpu"
     dtype: torch.dtype = torch.float32
 
-    T: int = 120
-    n_train: int = 0
-    n_val: int = 512
-    n_test: int = 0
-    batch_size: int = 64
-    num_workers: int = 0
-    pin_memory: bool = False
+    dataset: DatasetConfig = field(default_factory=DatasetConfig)
+    wm_cfg: WorldModelConfig = field(default_factory=lambda: WorldModelConfig(dz=1, dx=1))
 
-    wm_cfg: Optional[WorldModelConfig] = None
-    proposal_cfg: Optional[ProposalConfig] = None
+    # engine_name -> list of engine_cfg dicts (one run per cfg)
+    # engine_name must be one of:
+    #   evitrack_evidence, evitrack_joint, evitrack_tbd, bootstrap_pf, random_beam
+    inference_sweeps: Dict[str, List[Dict[str, Any]]] = field(default_factory=dict)
 
-    data_builder_name: str = "doublewell_1d"
-    data_builder_kwargs: Optional[Dict[str, Any]] = None
+    # Multiple inference seeds — controls stochasticity in sampling/resampling
+    inference_seeds: List[int] = field(default_factory=lambda: [0, 1, 2])
 
-    inference_sweeps: Optional[Dict[str, list]] = None
+    overwrite: bool = False
+    verbose: bool = True
 
+
+# ---------------------------------------------------------------
+# Experiment
+# ---------------------------------------------------------------
 
 class AnalyticalSyntheticExperiment(BaseExperiment):
+
     def __init__(self, cfg: AnalyticalSyntheticConfig):
         super().__init__(
             name=cfg.experiment_name,
             run_root=cfg.run_root,
             seed=cfg.seed,
+            use_seed_dir=False,
         )
         self.cfg = cfg
         self.device = torch.device(cfg.device)
         self.dtype = cfg.dtype
 
-    def _task_kwargs(self) -> Dict[str, Any]:
-        return dict(self.cfg.data_builder_kwargs or {})
+    # ----------------------------------------------------------
+    # Dataset: load or generate
+    # ----------------------------------------------------------
 
-    def _build_spec(self) -> Dict[str, Any]:
-        if self.cfg.data_builder_name != "doublewell_1d":
-            raise ValueError(
-                f"Unsupported analytical synthetic task '{self.cfg.data_builder_name}'. "
-                "Currently only 'doublewell_1d' is wired."
-            )
+    def _resolve_dataset(self) -> DoubleWell1DDatasetArtifact:
+        dc = self.cfg.dataset
 
-        kwargs = self._task_kwargs()
-        prior = make_prior(
-            z0_mean=kwargs.get("z0_mean", 0.0),
-            z0_std=kwargs.get("z0_std", 1.0),
-        )
-        transition = make_transition(
-            a=kwargs.get("a", 3.0),
-            V=kwargs.get("V", 0.06),
-            dt=kwargs.get("dt", 1.0),
-            sigma_z=kwargs.get("sigma_z", 0.05),
-        )
-        emission = make_emission(
-            d=kwargs.get("d", 2.0),
-            n=kwargs.get("n", 1),
-            sigma_x=kwargs.get("sigma_x", 0.12),
-        )
+        # 1) Try explicit path first
+        if dc.path is not None:
+            p = Path(dc.path)
+            if (p / "data.pt").exists():
+                if self.cfg.verbose:
+                    print(f"[dataset] Loading from {p}")
+                return DoubleWell1DDatasetArtifact.load(p)
+            elif not dc.generate:
+                raise FileNotFoundError(
+                    f"Dataset not found at {p} and generate=False."
+                )
 
-        meta = {
-            "task": "doublewell_1d",
-            "dz": 1,
-            "dx": 1,
-            "a": kwargs.get("a", 3.0),
-            "V": kwargs.get("V", 0.06),
-            "dt": kwargs.get("dt", 1.0),
-            "sigma_z": kwargs.get("sigma_z", 0.05),
-            "d": kwargs.get("d", 2.0),
-            "n": kwargs.get("n", 1),
-            "sigma_x": kwargs.get("sigma_x", 0.12),
-            "z0_mean": kwargs.get("z0_mean", 0.0),
-            "z0_std": kwargs.get("z0_std", 1.0),
-        }
+        # 2) Default cache location
+        default_path = self.run_dir / "dataset"
+        if (default_path / "data.pt").exists() and not self.cfg.overwrite:
+            if self.cfg.verbose:
+                print(f"[dataset] Loading cached dataset from {default_path}")
+            return DoubleWell1DDatasetArtifact.load(default_path)
 
-        return {
-            "prior": prior,
-            "transition": transition,
-            "emission": emission,
-            "meta": meta,
-        }
+        # 3) Generate
+        if not dc.generate:
+            raise FileNotFoundError("No dataset path provided and generate=False.")
 
-    def _build_data(self, spec):
-        return build_synthetic_bundle(
-            T=self.cfg.T,
-            n_train=self.cfg.n_train,
-            n_val=self.cfg.n_val,
-            n_test=self.cfg.n_test,
-            prior=spec["prior"],
-            transition=spec["transition"],
-            emission=spec["emission"],
-            seed=self.cfg.seed,
-            batch_size=self.cfg.batch_size,
+        if self.cfg.verbose:
+            print(f"[dataset] Generating {dc.n_delayed} delayed + "
+                  f"{dc.n_non_delayed} non-delayed trajectories (T={dc.T}) ...")
+
+        artifact = build_doublewell_1d_dataset(
+            T=dc.T,
+            n_delayed=dc.n_delayed,
+            n_non_delayed=dc.n_non_delayed,
+            search_seed_start=dc.search_seed_start,
+            max_seed_search=dc.max_seed_search,
             device=str(self.device),
             dtype=self.dtype,
-            num_workers=self.cfg.num_workers,
-            pin_memory=self.cfg.pin_memory,
-            drop_last_train=False,
-            include_latents_in_train=False,
-            include_latents_in_val=True,
-            include_latents_in_test=True,
-            extras=None,
-            meta=spec["meta"],
+            a=dc.a, V=dc.V, dt=dc.dt, sigma_z=dc.sigma_z,
+            d=dc.d, n=dc.n, sigma_x=dc.sigma_x,
+            z0_mean=dc.z0_mean, z0_std=dc.z0_std,
+            threshold=dc.threshold,
+            zmin=dc.zmin, zmax=dc.zmax, G=dc.G,
+            verbose=self.cfg.verbose,
         )
 
-    def _build_wm(self, spec) -> AnalyticalWorldModel:
-        wm_cfg = self.cfg.wm_cfg
-        if wm_cfg is None:
-            raise ValueError("cfg.wm_cfg must be provided.")
+        save_path = Path(dc.path) if dc.path is not None else default_path
+        artifact.save(save_path)
+        if self.cfg.verbose:
+            print(f"[dataset] Saved to {save_path}")
+
+        return artifact
+
+    # ----------------------------------------------------------
+    # World model (analytical — no training)
+    # ----------------------------------------------------------
+
+    def _build_wm(self) -> AnalyticalWorldModel:
+        dc = self.cfg.dataset
+        prior      = make_prior(z0_mean=dc.z0_mean, z0_std=dc.z0_std)
+        transition = make_transition(a=dc.a, V=dc.V, dt=dc.dt, sigma_z=dc.sigma_z)
+        emission   = make_emission(d=dc.d, n=dc.n, sigma_x=dc.sigma_x)
 
         wm = AnalyticalWorldModel(
-            cfg=wm_cfg,
-            prior_mu0=spec["prior"].mu0.to(device=self.device, dtype=self.dtype),
-            prior_cov0=spec["prior"].cov0.to(device=self.device, dtype=self.dtype),
-            trans_mean=spec["transition"].mean_fn,
-            trans_cov=spec["transition"].cov_fn,
-            emit_mean=spec["emission"].mean_fn,
-            emit_cov=spec["emission"].cov_fn,
+            cfg=self.cfg.wm_cfg,
+            prior_mu0=prior.mu0.to(device=self.device, dtype=self.dtype),
+            prior_cov0=prior.cov0.to(device=self.device, dtype=self.dtype),
+            trans_mean=transition.mean_fn,
+            trans_cov=transition.cov_fn,
+            emit_mean=emission.mean_fn,
+            emit_cov=emission.cov_fn,
         )
         return wm.to(device=self.device, dtype=self.dtype)
 
-    def _build_proposal(self, wm):
-        if self.cfg.proposal_cfg is None:
-            return None
-        q = Proposal(self.cfg.proposal_cfg, wm=wm)
-        return q.to(device=self.device, dtype=self.dtype)
+    # ----------------------------------------------------------
+    # Run
+    # ----------------------------------------------------------
 
     def run(self) -> Dict[str, Any]:
-        spec = self._build_spec()
-        data_bundle = self._build_data(spec)
+        artifact = self._resolve_dataset()
+        wm = self._build_wm()
 
-        wm = self._build_wm(spec)
-        proposal = self._build_proposal(wm)
+        N = artifact.x.shape[0]
+        n_delayed     = int(artifact.delayed_flag.sum().item())
+        n_non_delayed = int((~artifact.delayed_flag).sum().item())
 
+        if self.cfg.verbose:
+            print(f"\n[experiment] {self.cfg.experiment_name}")
+            print(f"  trajectories  : {N}  ({n_delayed} delayed, {n_non_delayed} non-delayed)")
+            print(f"  device        : {self.device}")
+            print(f"  engines       : {list(self.cfg.inference_sweeps.keys())}")
+            print(f"  inference seeds: {self.cfg.inference_seeds}\n")
+
+        # Save top-level experiment metadata once
+        # Points back to dataset — no duplication of x/z/flags
+        dataset_path = (
+            self.cfg.dataset.path
+            if self.cfg.dataset.path is not None
+            else str(self.run_dir / "dataset")
+        )
         self.save_metadata({
-            "kind": "analytical_synthetic",
-            "seed": self.cfg.seed,
-            "device": str(self.device),
-            "dtype": str(self.dtype),
-            "data_builder_name": self.cfg.data_builder_name,
-            "data_builder_kwargs": self.cfg.data_builder_kwargs or {},
-            "wm_cfg": self.cfg.wm_cfg,
-            "proposal_cfg": self.cfg.proposal_cfg,
-            "data_meta": data_bundle.meta,
+            "experiment_name":  self.cfg.experiment_name,
+            "seed":             self.cfg.seed,
+            "device":           str(self.device),
+            "N":                N,
+            "n_delayed":        n_delayed,
+            "n_non_delayed":    n_non_delayed,
+            "dataset_path":     dataset_path,
+            "dataset_meta":     artifact.meta,
+            "inference_seeds":  self.cfg.inference_seeds,
+            "inference_sweeps": self.cfg.inference_sweeps,
         })
 
-        results = {
-            "kind": "analytical_synthetic",
-            "seed": self.cfg.seed,
-            "data_meta": data_bundle.meta,
-            "engines": [],
+        run_summary: Dict[str, Any] = {
+            "experiment_name": self.cfg.experiment_name,
+            "N": N,
+            "runs": [],
         }
 
-        val_loader = data_bundle.val
+        # Loop: engine -> K config -> inference seed
+        # Folder: run_dir / engine_name / K{k} / inference_seed_{s} / traj_XXXX.pt
+        for engine_name, cfg_list in self.cfg.inference_sweeps.items():
+            for engine_cfg in cfg_list:
+                k_tag = _cfg_to_tag(engine_cfg)
 
-        for engine_name, cfg_list in (self.cfg.inference_sweeps or {}).items():
-            for i, engine_cfg in enumerate(cfg_list):
-                out = run_online_inference(
-                    wm=wm,
-                    proposal=proposal,
-                    data_loader=val_loader,
-                    engine_name=engine_name,
-                    engine_cfg=engine_cfg,
-                    seed=self.cfg.seed,
-                    device=self.device,
-                    dtype=self.dtype,
-                    max_batches=None,
-                )
-                save_inference_result(
-                    self.run_dir / "inference" / engine_name / f"run_{i:03d}.json",
-                    out,
-                )
-                results["engines"].append(out)
+                for inf_seed in self.cfg.inference_seeds:
+                    out_dir = (
+                        self.run_dir
+                        / engine_name
+                        / k_tag
+                        / f"inference_seed_{inf_seed:03d}"
+                    )
 
-        self.save_json(self.run_dir / "summary.json", results)
-        return results
+                    if self.cfg.verbose:
+                        print(f"[inference] {engine_name} | {k_tag} | "
+                              f"inference_seed={inf_seed}")
+
+                    saved = run_and_save_inference_states(
+                        wm=wm,
+                        proposal=None,          # analytical: no proposal
+                        artifact=artifact,
+                        engine_name=engine_name,
+                        engine_cfg=engine_cfg,
+                        out_dir=out_dir,
+                        inference_seed=inf_seed,
+                        device=self.device,
+                        dtype=self.dtype,
+                        overwrite=self.cfg.overwrite,
+                        verbose=self.cfg.verbose,
+                    )
+
+                    run_summary["runs"].append({
+                        "engine_name":    engine_name,
+                        "engine_cfg":     engine_cfg,
+                        "inference_seed": inf_seed,
+                        "out_dir":        str(out_dir),
+                        "n_saved":        len(saved),
+                    })
+
+        self.save_json(self.run_dir / "summary.json", run_summary)
+
+        if self.cfg.verbose:
+            print(f"\n[done] Results saved to: {self.run_dir}")
+
+        return run_summary
+
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+
+def _cfg_to_tag(cfg: Dict[str, Any]) -> str:
+    """
+    Convert engine cfg dict to a short directory-safe tag.
+    e.g. {"K": 5, "C": 3} -> "K5_C3"
+    Skips string-valued keys (expand, prune_score etc) for brevity.
+    """
+    parts = []
+    for k, v in cfg.items():
+        if isinstance(v, bool):
+            parts.append(f"{k}{int(v)}")
+        elif isinstance(v, float) and v == int(v):
+            parts.append(f"{k}{int(v)}")
+        elif isinstance(v, (int, float)):
+            parts.append(f"{k}{v}")
+    return "_".join(parts) if parts else "default"

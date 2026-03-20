@@ -211,3 +211,6 @@ __marimo__/
 results/
 misc/
 paper
+claude_code_dev
+codex_dev
+.claude

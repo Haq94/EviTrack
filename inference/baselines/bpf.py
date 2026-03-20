@@ -8,7 +8,7 @@ class BPFConfig:
     resample_every_step: bool = True
     ess_threshold_frac: float = 0.5
 
-class BFPEngine(ParticleFilterEngine):
+class BPFEngine(ParticleFilterEngine):
     def __init__(self, *, wm, cfg: BPFConfig):
         super().__init__(
             wm=wm,
