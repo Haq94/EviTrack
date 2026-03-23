@@ -25,37 +25,43 @@ def _seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def _engine_from_spec(name: str, wm, proposal, cfg_dict: Dict[str, Any]):
-    """
-    Build an inference engine from name + cfg dict.
-    prune_score / weight_mode are baked in by engine name for EviTrack variants.
-    expand and K/C/N must always be supplied explicitly in cfg_dict.
-    """
-    name = name.lower()
-    if name == "evitrack_evidence":
-        return EviTrackEngine(
-            wm=wm, proposal=proposal,
-            cfg=EviTrackConfig(prune_score="evidence", weight_mode="evidence", **cfg_dict),
-        )
-    if name == "evitrack_joint":
-        return EviTrackEngine(
-            wm=wm, proposal=proposal,
-            cfg=EviTrackConfig(prune_score="joint", weight_mode="joint", **cfg_dict),
-        )
-    if name == "evitrack_tbd":
-        return EviTrackEngine(
-            wm=wm, proposal=proposal,
-            cfg=EviTrackConfig(prune_score="tbd_joint", weight_mode="tbd_joint", **cfg_dict),
-        )
-    if name == "bootstrap_pf":
-        return BPFEngine(wm=wm, cfg=BPFConfig(**cfg_dict))
-    if name == "random_beam":
-        return RandomBeamEngine(wm=wm, proposal=proposal, cfg=RandomBeamConfig(**cfg_dict))
-    raise ValueError(
-        f"Unknown engine: '{name}'. "
-        f"Valid: evitrack_evidence, evitrack_joint, evitrack_tbd, bootstrap_pf, random_beam"
-    )
+def _engine_from_spec(cfg_dict: Dict[str, Any], wm, proposal):
+    from inference.baselines.sis import SISEngine
+    from inference.baselines.smc import SMCEngine, SMCConfig
 
+    cfg_dict    = dict(cfg_dict)
+    engine      = cfg_dict.pop("engine")
+    weight_mode = cfg_dict.pop("weight_mode", None)
+    prune_score = cfg_dict.pop("prune_score", None)
+
+    if engine == "evitrack":
+        return EviTrackEngine(
+            wm=wm, proposal=proposal,
+            cfg=EviTrackConfig(
+                prune_score=prune_score,
+                weight_mode=weight_mode,
+                **cfg_dict,
+            ),
+        )
+    if engine == "bootstrap_pf":
+        return BPFEngine(wm=wm, cfg=BPFConfig(**cfg_dict))
+    if engine == "random_beam":
+        return RandomBeamEngine(
+            wm=wm, proposal=proposal,
+            cfg=RandomBeamConfig(**cfg_dict),
+        )
+    if engine == "sis":
+        # SIS requires a proposal
+        assert proposal is not None, "SIS requires a proposal"
+        return SISEngine(wm=wm, proposal=proposal, N=cfg_dict["N"])
+    if engine == "smc":
+        # SMC requires a proposal
+        assert proposal is not None, "SMC requires a proposal"
+        return SMCEngine(wm=wm, proposal=proposal, cfg=SMCConfig(**cfg_dict))
+    raise ValueError(
+        f"Unknown engine: '{engine}'. "
+        f"Valid: evitrack, bootstrap_pf, random_beam, sis, smc"
+    )
 
 def _extract_state_snapshot(state) -> Dict[str, np.ndarray]:
     """
@@ -187,7 +193,7 @@ def run_and_save_inference_states(
         x_i = artifact.x[i].to(device=device, dtype=dtype)   # [T, dx]
         T   = x_i.shape[0]
 
-        engine = _engine_from_spec(engine_name, wm=wm, proposal=proposal, cfg_dict=engine_cfg)
+        engine = _engine_from_spec(engine_cfg, wm=wm, proposal=proposal)
         state  = engine.init_state(B=1, device=str(device), dtype=dtype)
 
         snapshots: List[Dict[str, np.ndarray]] = []
