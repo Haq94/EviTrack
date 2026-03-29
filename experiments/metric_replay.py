@@ -86,7 +86,7 @@ def compute_weights_evitrack(
         scores = npz["E"].astype(np.float64)
     elif weight_mode == "joint":
         scores = npz["J"].astype(np.float64)
-    elif weight_mode == "tbd":
+    elif weight_mode == "tbd_joint":
         scores = npz["J_tbd"].astype(np.float64)
     else:
         raise ValueError(
@@ -118,7 +118,7 @@ def compute_log_weights(
     if type_id == 1:
         return compute_weights_particle(npz)
     # EviTrack / RandomBeam — read weight_mode from saved engine_cfg
-    weight_mode = engine_cfg.get("weight_mode", "evidence")
+    weight_mode = engine_cfg["weight_mode"]
     return compute_weights_evitrack(npz, weight_mode)
 
 
@@ -404,13 +404,22 @@ def replay_single_trajectory(
     pll_all         = np.full((T, num_horizons), np.nan, dtype=np.float64)
     mse_all         = np.full((T, num_horizons), np.nan, dtype=np.float64)
     branch_acc_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)
-    coverage_50_all = np.full((T, num_horizons), np.nan, dtype=np.float64)  # NEW
-    coverage_90_all = np.full((T, num_horizons), np.nan, dtype=np.float64)  # NEW
+    coverage_50_all = np.full((T, num_horizons), np.nan, dtype=np.float64)
+    coverage_90_all = np.full((T, num_horizons), np.nan, dtype=np.float64)
+
+    p_positive_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)  # P(Z_{t+H} > 0)
+    p_negative_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)  # P(Z_{t+H} < 0)
+    ess_all         = np.full(T, np.nan, dtype=np.float64)                  # ESS at each t
 
     has_wm_z_state = "wm_z_state" in data
     has_wm_x_state = "wm_x_state" in data
 
     for t in range(T):
+        # Compute ESS from weights at this timestep
+        weights_t = np.exp(log_w[t])  # [K]
+        weights_t = weights_t / (np.sum(weights_t) + 1e-12)  # Normalize
+        ess_all[t] = 1.0 / (np.sum(weights_t ** 2) + 1e-12)
+
         remaining = T - t - 1
         if remaining < 1:
             break
@@ -437,7 +446,7 @@ def replay_single_trajectory(
             dtype=dtype,
             z_state_start=z_state_t,
             x_state_start=x_state_t,
-            rollout_mode=rollout_mode,   # NEW
+            rollout_mode=rollout_mode,
         )
 
         z_roll_np   = z_roll.cpu().numpy()
@@ -470,14 +479,37 @@ def replay_single_trajectory(
             coverage_50_all[t, full_idx] = metrics["coverage_50"][vi]   # NEW
             coverage_90_all[t, full_idx] = metrics["coverage_90"][vi]   # NEW
 
+            # NEW: Compute branch probabilities
+            # z_roll_np is [K, M, H_max, dz]
+            h_idx = h - 1  # 0-indexed
+            if h_idx < z_roll_np.shape[2]:
+                z_roll_h = z_roll_np[:, :, h_idx, 0]  # [K, M] - position at horizon h
+
+                # For each hypothesis k, what fraction of samples are positive?
+                frac_pos_per_hyp = np.mean(z_roll_h > 0, axis=1)  # [K]
+                frac_neg_per_hyp = np.mean(z_roll_h < 0, axis=1)  # [K]
+
+                # Weight by hypothesis weights
+                weights_t_norm = np.exp(log_w[t])
+                weights_t_norm = weights_t_norm / (np.sum(weights_t_norm) + 1e-12)
+
+                p_pos = np.sum(weights_t_norm * frac_pos_per_hyp)
+                p_neg = np.sum(weights_t_norm * frac_neg_per_hyp)
+
+                p_positive_all[t, full_idx] = p_pos
+                p_negative_all[t, full_idx] = p_neg
+
     return {
-        "pll":         pll_all,
-        "mse":         mse_all,
-        "branch_acc":  branch_acc_all,
-        "coverage_50": coverage_50_all,   # NEW
-        "coverage_90": coverage_90_all,   # NEW
-        "traj_index":  traj_idx,
-    }
+            "pll":         pll_all,
+            "mse":         mse_all,
+            "branch_acc":  branch_acc_all,
+            "coverage_50": coverage_50_all,
+            "coverage_90": coverage_90_all,
+            "p_positive":  p_positive_all,    # NEW
+            "p_negative":  p_negative_all,    # NEW
+            "ess":         ess_all,           # NEW
+            "traj_index":  traj_idx,
+        }
 
 
 # ---------------------------------------------------------------
@@ -528,22 +560,35 @@ def _replay_engine(
     rollout_mode: str = "autoregressive",   # NEW
     verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
-    all_pll         = []
-    all_mse         = []
-    all_branch_acc  = []
-    all_coverage_50 = []   # NEW
-    all_coverage_90 = []   # NEW
-    all_traj_idx    = []
-    all_seed_idx    = []
 
-    for si, seed_dir in enumerate(seed_dirs):
-        traj_paths = _list_traj_npz(seed_dir)
-        if verbose:
-            print(f"    {seed_dir.name}: {len(traj_paths)} trajectories")
+    x = dataset["x"]
+    z = dataset["z"]
+    N, T, dx = x.shape
+    num_h = len(horizons)
 
-        for tp in traj_paths:
+    pll_accum         = []
+    mse_accum         = []
+    branch_acc_accum  = []
+    coverage_50_accum = []
+    coverage_90_accum = []
+    p_positive_accum  = []  # NEW
+    p_negative_accum  = []  # NEW
+    ess_accum         = []  # NEW
+    traj_indices      = []
+    seed_indices      = []
+
+    for seed_idx, seed_dir in enumerate(seed_dirs):
+        traj_files = _list_traj_npz(seed_dir)
+
+        for traj_file in traj_files:
+            data = dict(np.load(traj_file, allow_pickle=False))
+            traj_idx = int(data["traj_index"])
+
+            # x_i = x[traj_idx].numpy()
+            # z_i = z[traj_idx].numpy()
+
             result = replay_single_trajectory(
-                npz_path=tp,
+                npz_path=traj_file,
                 dataset=dataset,
                 wm=wm,
                 engine_cfg=engine_cfg,
@@ -551,27 +596,34 @@ def _replay_engine(
                 n_rollout_samples=n_rollout_samples,
                 device=device,
                 dtype=dtype,
-                rollout_mode=rollout_mode,   # NEW
+                rollout_mode=rollout_mode,
             )
-            all_pll.append(result["pll"])
-            all_mse.append(result["mse"])
-            all_branch_acc.append(result["branch_acc"])
-            all_coverage_50.append(result["coverage_50"])   # NEW
-            all_coverage_90.append(result["coverage_90"])   # NEW
-            all_traj_idx.append(result["traj_index"])
-            all_seed_idx.append(si)
 
-    if len(all_pll) == 0:
-        return {}
+            pll_accum.append(result["pll"])
+            mse_accum.append(result["mse"])
+            branch_acc_accum.append(result["branch_acc"])
+            coverage_50_accum.append(result["coverage_50"])
+            coverage_90_accum.append(result["coverage_90"])
+            p_positive_accum.append(result["p_positive"])  # NEW
+            p_negative_accum.append(result["p_negative"])  # NEW
+            ess_accum.append(result["ess"])                # NEW
+            traj_indices.append(traj_idx)
+            seed_indices.append(seed_idx)
+
+    if not pll_accum:
+        return None
 
     return {
-        "pll":         np.stack(all_pll,         axis=0),
-        "mse":         np.stack(all_mse,         axis=0),
-        "branch_acc":  np.stack(all_branch_acc,  axis=0),
-        "coverage_50": np.stack(all_coverage_50, axis=0),   # NEW
-        "coverage_90": np.stack(all_coverage_90, axis=0),   # NEW
-        "traj_index":  np.array(all_traj_idx,    dtype=np.int64),
-        "seed_index":  np.array(all_seed_idx,    dtype=np.int64),
+        "pll":         np.stack(pll_accum, axis=0),
+        "mse":         np.stack(mse_accum, axis=0),
+        "branch_acc":  np.stack(branch_acc_accum, axis=0),
+        "coverage_50": np.stack(coverage_50_accum, axis=0),
+        "coverage_90": np.stack(coverage_90_accum, axis=0),
+        "p_positive":  np.stack(p_positive_accum, axis=0),  # NEW
+        "p_negative":  np.stack(p_negative_accum, axis=0),  # NEW
+        "ess":         np.stack(ess_accum, axis=0),         # NEW
+        "traj_index":  np.array(traj_indices, dtype=np.int64),
+        "seed_index":  np.array(seed_indices, dtype=np.int64),
     }
 
 
@@ -662,6 +714,9 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
             branch_acc=agg["branch_acc"],
             coverage_50=agg["coverage_50"],
             coverage_90=agg["coverage_90"],
+            p_positive=agg["p_positive"],    # NEW
+            p_negative=agg["p_negative"],    # NEW
+            ess=agg["ess"],                  # NEW
             traj_index=agg["traj_index"],
             seed_index=agg["seed_index"],
             delayed_flag=agg["delayed_flag"],

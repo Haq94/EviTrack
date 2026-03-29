@@ -17,11 +17,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from typing import Any, Dict
-
+from dataclasses import dataclass
 import torch
 
 from data.dataset_io import save_dataset, load_dataset
-from data.synthetic_tasks.doublewell_1d_dataset import build_doublewell_1d_dataset
+from data.synthetic_tasks.doublewell_1d_dataset import (
+    build_doublewell_1d_dataset, build_doublewell_1d_dataset_with_bins
+    )
 from experiments.doublewell_analytical import (
     DoubleWellAnalyticalConfig,
     build_wm,
@@ -29,38 +31,62 @@ from experiments.doublewell_analytical import (
     run_replay,
     run_plots,
 )
-# from experiments.doublewell_trained import (
-#     DoubleWellTrainedConfig,
-#     run_inference  as run_trained_inference,
-#     run_replay     as run_trained_replay,
-#     run_plots      as run_trained_plots,
-# )
 
 
 # ============================================================
-# TOP-LEVEL CONTROLS  <-- reviewers edit only this section
+# TOP-LEVEL CONTROLS
 # ============================================================
 
 RUN_ALL  = True
 EXP_NAME = "doublewell_analytical_inference"   # used when RUN_ALL = False
 
+# Experiment name for organizing results
+EXPERIMENT_NAME = "test_run_3"  # Change this for different runs (e.g., "main_run", "ablation_1")
+
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = "results"
-PLOTS_DIR   = "results/plots"
+RESULTS_DIR = f"results/{EXPERIMENT_NAME}"
+PLOTS_DIR   = f"results/{EXPERIMENT_NAME}/plots"
 
 # Path to an existing dataset directory (data.pt + metadata.json).
-# None = generate and cache to RESULTS_DIR/doublewell_analytical/dataset/
-DATASET_PATH = None
+# None = generate and cache to RESULTS_DIR/dataset/
+DATASET_PATH = None  # Set to f"results/{EXPERIMENT_NAME}" to reuse dataset
+
+@dataclass
+class DoubleWellParams:
+    """Single source of truth for double-well task parameters."""
+    T: int = 200
+    a: float = 3.0
+    V: float = 0.06
+    dt: float = 1.0
+    sigma_z: float = 0.05
+    d: float = 2.0
+    n: int = 1
+    sigma_x: float = 0.12
+    z0_mean: float = 0.0
+    z0_std: float = 1.0
+    threshold: float = 0.8
+
+# Global instance
+DOUBLEWELL_PARAMS = DoubleWellParams()
+
+# Disambiguation time bin targets
+DD_TIME_BIN_TARGETS = {
+    (0, 40): 250,      # Early disambiguation
+    (40, 80): 250,     # Mid disambiguation
+    (80, 120): 250,    # Late disambiguation
+    (120, 200): 250,    # Very late disambiguation
+}
 
 
 # ============================================================
 # Dataset
 # ============================================================
 
+
 def _get_dataset_path() -> str:
     if DATASET_PATH is not None:
         return DATASET_PATH
-    return str(Path(RESULTS_DIR) / "doublewell_analytical" / "dataset")
+    return str(Path(RESULTS_DIR) / "dataset")
 
 
 def _load_or_generate_dataset() -> Dict[str, Any]:
@@ -68,21 +94,29 @@ def _load_or_generate_dataset() -> Dict[str, Any]:
     if (path / "data.pt").exists():
         return load_dataset(path)
 
-    print("[dataset] Generating double-well benchmark dataset ...")
-    artifact = build_doublewell_1d_dataset(
-        T=120,
-        n_delayed=500,
-        n_non_delayed=500,
+    print("[dataset] Generating double-well benchmark dataset with controlled bins...")
+    p = DOUBLEWELL_PARAMS
+
+    artifact = build_doublewell_1d_dataset_with_bins(  # CHANGED
+        T=p.T,
+        dd_time_targets=DD_TIME_BIN_TARGETS,  # NEW
         search_seed_start=0,
-        max_seed_search=100_000,
+        max_seed_search=100_000_000,  # Increased for binned search
         device="cpu",
         dtype=torch.float32,
-        a=3.0, V=0.06, dt=1.0, sigma_z=0.05,
-        d=2.0, n=1, sigma_x=0.12,
-        z0_mean=0.0, z0_std=1.0,
-        threshold=0.8,
+        a=p.a,
+        V=p.V,
+        dt=p.dt,
+        sigma_z=p.sigma_z,
+        d=p.d,
+        n=p.n,
+        sigma_x=p.sigma_x,
+        z0_mean=p.z0_mean,
+        z0_std=p.z0_std,
+        threshold=p.threshold,
         verbose=True,
     )
+
     # Convert artifact to plain dict
     dataset = {
         "x":             artifact.x,
@@ -101,25 +135,33 @@ def _load_or_generate_dataset() -> Dict[str, Any]:
 # ============================================================
 
 def _analytical_cfg() -> DoubleWellAnalyticalConfig:
+    p = DOUBLEWELL_PARAMS  # Use shared params
+
     return DoubleWellAnalyticalConfig(
-        results_dir=str(Path(RESULTS_DIR) / "doublewell_analytical"),
-        plots_dir=str(Path(PLOTS_DIR) / "doublewell_analytical"),
+        results_dir=RESULTS_DIR,
+        plots_dir=PLOTS_DIR,
         device=DEVICE,
         overwrite=False,
         verbose=True,
 
-        # Task — must match dataset generation above
-        T=120,
-        a=3.0, V=0.06, dt=1.0, sigma_z=0.05,
-        d=2.0, n=1, sigma_x=0.12,
-        z0_mean=0.0, z0_std=1.0,
+        # Task — uses shared params
+        T=p.T,
+        a=p.a,
+        V=p.V,
+        dt=p.dt,
+        sigma_z=p.sigma_z,
+        d=p.d,
+        n=p.n,
+        sigma_x=p.sigma_x,
+        z0_mean=p.z0_mean,
+        z0_std=p.z0_std,
 
         # Inference
-        inference_seeds=[0, 1, 2, 3 , 4],
+        inference_seeds=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
 
         # Replay
-        horizons=[1, 5, 10, 20, 30],
-        n_rollout_samples=50,
+        horizons=[1, 5, 10, 20, 50],
+        n_rollout_samples=20,
     )
 
 

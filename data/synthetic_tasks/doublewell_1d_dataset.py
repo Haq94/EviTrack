@@ -331,6 +331,184 @@ def build_doublewell_1d_dataset(
         meta=meta,
     )
 
+def build_doublewell_1d_dataset_with_bins(
+    *,
+    T: int,
+    dd_time_targets: Dict[Tuple[int, int], int],  # {(0,40): 100, (40,80): 100, ...}
+    search_seed_start: int = 0,
+    max_seed_search: int = 500000,
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.float32,
+    # double-well params
+    a: float = 3.0,
+    V: float = 0.06,
+    dt: float = 1.0,
+    sigma_z: float = 0.05,
+    d: float = 2.0,
+    n: int = 1,
+    sigma_x: float = 0.12,
+    z0_mean: float = 0.0,
+    z0_std: float = 1.0,
+    # delayed-disambiguation annotation
+    threshold: float = 0.8,
+    zmin: float = -4.0,
+    zmax: float = 4.0,
+    G: int = 1000,
+    verbose: bool = True,
+) -> DoubleWell1DDatasetArtifact:
+    """
+    Generate dataset with controlled disambiguation time distribution.
+
+    Args:
+        dd_time_targets: Dictionary mapping (start, end) time bins to target counts.
+            Example: {(0, 40): 100, (40, 80): 100, (80, 120): 100, (120, 200): 50}
+
+    Returns:
+        Dataset artifact with trajectories distributed according to dd_time_targets.
+    """
+    prior = make_prior(z0_mean=z0_mean, z0_std=z0_std)
+    transition = make_transition(a=a, V=V, dt=dt, sigma_z=sigma_z)
+    emission = make_emission(d=d, n=n, sigma_x=sigma_x)
+
+    # Initialize bins
+    bins = sorted(dd_time_targets.keys())
+    bin_examples = {bin_key: [] for bin_key in bins}
+    bin_seeds = {bin_key: [] for bin_key in bins}
+    bin_times = {bin_key: [] for bin_key in bins}
+    bin_counts = {bin_key: 0 for bin_key in bins}
+    bin_targets = dd_time_targets.copy()
+
+    seeds_checked = 0
+    seed = int(search_seed_start)
+
+    total_needed = sum(bin_targets.values())
+    total_collected = 0
+
+    while seeds_checked < max_seed_search:
+        # Check if all bins are filled
+        if total_collected >= total_needed:
+            break
+
+        batch = generate_sequences(
+            T=T,
+            B=1,
+            prior=prior,
+            transition=transition,
+            emission=emission,
+            seed=seed,
+            return_logp=False,
+            extras=None,
+            device=device,
+            dtype=dtype,
+        )
+
+        x_i = batch.x[0].detach().cpu()   # [T, dx]
+        z_i = batch.z[0].detach().cpu()   # [T, dz]
+
+        disamb_t = estimate_disambiguation_time_quadrature(
+            x_i,
+            T=T,
+            a=a,
+            V=V,
+            dt=dt,
+            sigma_z=sigma_z,
+            d=d,
+            n=n,
+            sigma_x=sigma_x,
+            z0_std=z0_std,
+            threshold=threshold,
+            zmin=zmin,
+            zmax=zmax,
+            G=G,
+        )
+
+        # Find which bin this trajectory belongs to
+        if disamb_t >= 0:
+            for (start, end), target in bin_targets.items():
+                if start <= disamb_t < end:
+                    if bin_counts[(start, end)] < target:
+                        bin_examples[(start, end)].append((x_i, z_i))
+                        bin_seeds[(start, end)].append(seed)
+                        bin_times[(start, end)].append(disamb_t)
+                        bin_counts[(start, end)] += 1
+                        total_collected += 1
+                    break
+
+        seeds_checked += 1
+        seed += 1
+
+        if verbose and seeds_checked % 100 == 0:
+            status = " | ".join([
+                f"{start}-{end}: {bin_counts[(start,end)]}/{target}"
+                for (start, end), target in sorted(bin_targets.items())
+            ])
+            print(f"[search] checked={seeds_checked} | {status}")
+
+    # Check if we got all targets
+    missing_bins = [
+        f"{start}-{end}: {bin_counts[(start,end)]}/{target}"
+        for (start, end), target in bin_targets.items()
+        if bin_counts[(start, end)] < target
+    ]
+    if missing_bins:
+        raise RuntimeError(
+            f"Failed to collect all targets within max_seed_search. "
+            f"Missing: {', '.join(missing_bins)} | checked={seeds_checked}"
+        )
+
+    # Combine all bins in order
+    all_examples = []
+    all_seed_ids = []
+    all_disamb_time = []
+    bin_start_indices = {}
+
+    idx = 0
+    for bin_key in bins:
+        bin_start_indices[bin_key] = idx
+        all_examples.extend(bin_examples[bin_key])
+        all_seed_ids.extend(bin_seeds[bin_key])
+        all_disamb_time.extend(bin_times[bin_key])
+        idx += len(bin_examples[bin_key])
+
+    x = torch.stack([ex[0] for ex in all_examples], dim=0)   # [N, T, dx]
+    z = torch.stack([ex[1] for ex in all_examples], dim=0)   # [N, T, dz]
+
+    meta = {
+        "task": "doublewell_1d",
+        "T": int(T),
+        "dz": int(z.shape[-1]),
+        "dx": int(x.shape[-1]),
+        "a": float(a),
+        "V": float(V),
+        "dt": float(dt),
+        "sigma_z": float(sigma_z),
+        "d": float(d),
+        "n": int(n),
+        "sigma_x": float(sigma_x),
+        "z0_mean": float(z0_mean),
+        "z0_std": float(z0_std),
+        "delay_threshold": float(threshold),
+        "quadrature_zmin": float(zmin),
+        "quadrature_zmax": float(zmax),
+        "quadrature_G": int(G),
+        "search_seed_start": int(search_seed_start),
+        "max_seed_search": int(max_seed_search),
+        "num_sequences": int(len(all_examples)),
+        "dd_time_bins": {f"{start}-{end}": count for (start, end), count in bin_counts.items()},
+        "bin_start_indices": {f"{start}-{end}": int(bin_start_indices[(start, end)])
+                              for start, end in bins},
+        "data_seed_ids": all_seed_ids,
+    }
+
+    return DoubleWell1DDatasetArtifact(
+        x=x,
+        z=z,
+        data_seed_ids=torch.tensor(all_seed_ids, dtype=torch.long),
+        delayed_flag=torch.ones(len(all_examples), dtype=torch.bool),  # All are delayed
+        disamb_time=torch.tensor(all_disamb_time, dtype=torch.long),
+        meta=meta,
+    )
+
 
 if __name__ == "__main__":
     # Edit these as needed for direct dataset generation from this script.
