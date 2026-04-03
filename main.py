@@ -32,6 +32,20 @@ from experiments.doublewell_analytical import (
     run_plots,
 )
 
+from experiments.global_pruning_ablation import (
+    GlobalPruningAblationConfig,
+    build_wm as build_wm_pruning,
+    run_inference as run_inference_pruning,
+    run_replay as run_replay_pruning,
+)
+
+from experiments.inference_budget_ablation import (
+    InferenceBudgetAblationConfig,
+    build_wm as build_wm_budget,
+    run_inference as run_inference_budget,
+    run_replay as run_replay_budget,
+)
+
 
 # ============================================================
 # TOP-LEVEL CONTROLS
@@ -40,12 +54,12 @@ from experiments.doublewell_analytical import (
 RUN_ALL  = True
 EXP_NAME = "doublewell_analytical_inference"   # used when RUN_ALL = False
 
-# Experiment name for organizing results
-EXPERIMENT_NAME = "test_run_3"  # Change this for different runs (e.g., "main_run", "ablation_1")
+# Folder name for organizing results
+FOLDER_NAME = "ablations_run_1"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
-RESULTS_DIR = f"results/{EXPERIMENT_NAME}"
-PLOTS_DIR   = f"results/{EXPERIMENT_NAME}/plots"
+RESULTS_DIR = f"results/{FOLDER_NAME}"
+PLOTS_DIR   = f"results/{FOLDER_NAME}/plots"
 
 # Path to an existing dataset directory (data.pt + metadata.json).
 # None = generate and cache to RESULTS_DIR/dataset/
@@ -69,14 +83,27 @@ class DoubleWellParams:
 # Global instance
 DOUBLEWELL_PARAMS = DoubleWellParams()
 
-# Disambiguation time bin targets
+# Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
     (0, 40): 250,      # Early disambiguation
     (40, 80): 250,     # Mid disambiguation
     (80, 120): 250,    # Late disambiguation
     (120, 200): 250,    # Very late disambiguation
 }
-
+# Disambiguation time bin targets for pruning ablation 
+DD_TIME_BIN_TARGETS_PRUNING = {
+    (0, 40):    100,
+    (40, 80):   100,
+    (80, 120):  100,
+    (120, 200): 100,
+}
+# DD time bins for budget ablation
+DD_TIME_BIN_TARGETS_BUDGET = {
+    (0, 40):    100,
+    (40, 80):   100,
+    (80, 120):  100,
+    (120, 200): 100,
+}
 
 # ============================================================
 # Dataset
@@ -86,7 +113,7 @@ DD_TIME_BIN_TARGETS = {
 def _get_dataset_path() -> str:
     if DATASET_PATH is not None:
         return DATASET_PATH
-    return str(Path(RESULTS_DIR) / "dataset")
+    return str(Path(f"{RESULTS_DIR}/doublewell_analytical/dataset"))
 
 
 def _load_or_generate_dataset() -> Dict[str, Any]:
@@ -130,6 +157,75 @@ def _load_or_generate_dataset() -> Dict[str, Any]:
     return dataset
 
 
+def _get_pruning_dataset_path() -> str:
+    return str(Path(f"{RESULTS_DIR}/global_pruning_ablation/dataset"))
+
+
+def _load_or_generate_pruning_dataset() -> Dict[str, Any]:
+    path = Path(_get_pruning_dataset_path())
+    if (path / "data.pt").exists():
+        return load_dataset(path)
+
+    print("[dataset] Generating pruning ablation dataset...")
+    p = DOUBLEWELL_PARAMS
+    artifact = build_doublewell_1d_dataset_with_bins(
+        T=p.T,
+        dd_time_targets=DD_TIME_BIN_TARGETS_PRUNING,
+        search_seed_start=0,
+        max_seed_search=100_000_000,
+        device="cpu",
+        dtype=torch.float32,
+        a=p.a, V=p.V, dt=p.dt, sigma_z=p.sigma_z,
+        d=p.d, n=p.n, sigma_x=p.sigma_x,
+        z0_mean=p.z0_mean, z0_std=p.z0_std,
+        threshold=p.threshold,
+        verbose=True,
+    )
+    dataset = {
+        "x":             artifact.x,
+        "z":             artifact.z,
+        "data_seed_ids": artifact.data_seed_ids,
+        "delayed_flag":  artifact.delayed_flag,
+        "disamb_time":   artifact.disamb_time,
+        "meta":          artifact.meta,
+    }
+    save_dataset(dataset, path)
+    return dataset
+
+def _get_budget_dataset_path() -> str:
+    return str(Path(f"{RESULTS_DIR}/inference_budget_ablation/dataset"))
+
+def _load_or_generate_budget_dataset() -> Dict[str, Any]:
+    path = Path(_get_budget_dataset_path())
+    if (path / "data.pt").exists():
+        return load_dataset(path)
+    print("[dataset] Generating budget ablation dataset...")
+    p = DOUBLEWELL_PARAMS
+    artifact = build_doublewell_1d_dataset_with_bins(
+        T=p.T,
+        dd_time_targets=DD_TIME_BIN_TARGETS_BUDGET,
+        search_seed_start=0,
+        max_seed_search=100_000_000,
+        device="cpu",
+        dtype=torch.float32,
+        a=p.a, V=p.V, dt=p.dt, sigma_z=p.sigma_z,
+        d=p.d, n=p.n, sigma_x=p.sigma_x,
+        z0_mean=p.z0_mean, z0_std=p.z0_std,
+        threshold=p.threshold,
+        verbose=True,
+    )
+    dataset = {
+        "x":             artifact.x,
+        "z":             artifact.z,
+        "data_seed_ids": artifact.data_seed_ids,
+        "delayed_flag":  artifact.delayed_flag,
+        "disamb_time":   artifact.disamb_time,
+        "meta":          artifact.meta,
+    }
+    save_dataset(dataset, path)
+    return dataset
+
+
 # ============================================================
 # Experiment configs
 # ============================================================
@@ -138,7 +234,7 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
     p = DOUBLEWELL_PARAMS  # Use shared params
 
     return DoubleWellAnalyticalConfig(
-        results_dir=RESULTS_DIR,
+        results_dir=f"{RESULTS_DIR}/doublewell_analytical",
         plots_dir=PLOTS_DIR,
         device=DEVICE,
         overwrite=False,
@@ -164,6 +260,40 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
         n_rollout_samples=20,
     )
 
+def _pruning_ablation_cfg() -> GlobalPruningAblationConfig:
+    p = DOUBLEWELL_PARAMS
+    return GlobalPruningAblationConfig(
+        results_dir=f"{RESULTS_DIR}/global_pruning_ablation",
+        device=DEVICE,
+        overwrite=False,
+        verbose=True,
+        T=p.T, a=p.a, V=p.V, dt=p.dt, sigma_z=p.sigma_z,
+        d=p.d, n=p.n, sigma_x=p.sigma_x,
+        z0_mean=p.z0_mean, z0_std=p.z0_std,
+        G_values=[1, 5, 10, 20],
+        K=5,
+        C=3,
+        inference_seeds=[0, 1, 2],
+        horizons=[1, 5, 10, 20, 50],
+        n_rollout_samples=20,
+    )
+
+def _budget_ablation_cfg() -> InferenceBudgetAblationConfig:
+    p = DOUBLEWELL_PARAMS
+    return InferenceBudgetAblationConfig(
+        results_dir=f"{RESULTS_DIR}/inference_budget_ablation",
+        device=DEVICE,
+        overwrite=False,
+        verbose=True,
+        T=p.T, a=p.a, V=p.V, dt=p.dt, sigma_z=p.sigma_z,
+        d=p.d, n=p.n, sigma_x=p.sigma_x,
+        z0_mean=p.z0_mean, z0_std=p.z0_std,
+        budget_sweeps=[(3,2), (5,3), (10,3), (15,3)],
+        G=1,
+        inference_seeds=[0, 1, 2],                  # [0, 1, 2]
+        horizons=[1, 5, 10, 20, 50],                      # [1, 5, 10, 20, 50]
+        n_rollout_samples=20,                  # 20
+    )
 
 # ============================================================
 # Registry
@@ -183,6 +313,30 @@ def exp_doublewell_analytical_replay() -> None:
     cfg = _analytical_cfg()
     wm  = build_wm(cfg)
     run_replay(cfg, dataset, wm)
+
+def exp_pruning_ablation_inference() -> None:
+    dataset = _load_or_generate_pruning_dataset()
+    cfg = _pruning_ablation_cfg()
+    wm = build_wm_pruning(cfg)
+    run_inference_pruning(cfg, dataset, wm)
+
+def exp_pruning_ablation_replay() -> None:
+    dataset = _load_or_generate_pruning_dataset()
+    cfg = _pruning_ablation_cfg()
+    wm = build_wm_pruning(cfg)
+    run_replay_pruning(cfg, dataset, wm)
+
+def exp_budget_ablation_inference() -> None:
+    dataset = _load_or_generate_budget_dataset()
+    cfg = _budget_ablation_cfg()
+    wm = build_wm_budget(cfg)
+    run_inference_budget(cfg, dataset, wm)
+
+def exp_budget_ablation_replay() -> None:
+    dataset = _load_or_generate_budget_dataset()
+    cfg = _budget_ablation_cfg()
+    wm = build_wm_budget(cfg)
+    run_replay_budget(cfg, dataset, wm)
 
 
 def exp_doublewell_analytical_plots() -> None:
@@ -212,9 +366,13 @@ def exp_doublewell_analytical_plots() -> None:
 
 
 REGISTRY: Dict[str, Any] = {
-    "doublewell_analytical_inference": exp_doublewell_analytical_inference,
-    "doublewell_analytical_replay":    exp_doublewell_analytical_replay,
-    "doublewell_analytical_plots":     exp_doublewell_analytical_plots,
+    # "doublewell_analytical_inference": exp_doublewell_analytical_inference,
+    # "doublewell_analytical_replay":    exp_doublewell_analytical_replay,
+    "pruning_ablation_inference": exp_pruning_ablation_inference,
+    "pruning_ablation_replay":    exp_pruning_ablation_replay,
+    "budget_ablation_inference": exp_budget_ablation_inference,
+    "budget_ablation_replay":    exp_budget_ablation_replay,
+    # "doublewell_analytical_plots":     exp_doublewell_analytical_plots,
     # "doublewell_trained_inference":  exp_doublewell_trained_inference,
     # "doublewell_trained_replay":     exp_doublewell_trained_replay,
     # "doublewell_trained_plots":      exp_doublewell_trained_plots,
