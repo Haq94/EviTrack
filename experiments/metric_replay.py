@@ -115,9 +115,20 @@ def compute_log_weights(
     engine_cfg: Dict[str, Any],
 ) -> np.ndarray:
     type_id = int(npz["type_id"])
+
+    # Particle filter
     if type_id == 1:
         return compute_weights_particle(npz)
-    # EviTrack / RandomBeam — read weight_mode from saved engine_cfg
+
+    # Random beam: uniform weights over retained hypotheses
+    engine_name = str(engine_cfg.get("engine", "")).lower()
+    if engine_name == "random_beam":
+        K = npz["z"].shape[1]   # z has shape [T, K, dz]
+        T = npz["z"].shape[0]
+        logw = np.full((T, K), -math.log(K), dtype=np.float64)
+        return logw
+
+    # EviTrack
     weight_mode = engine_cfg["weight_mode"]
     return compute_weights_evitrack(npz, weight_mode)
 
