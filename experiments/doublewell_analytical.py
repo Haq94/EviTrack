@@ -106,23 +106,24 @@ def build_wm(cfg: DoubleWellAnalyticalConfig) -> AnalyticalWorldModel:
 # ============================================================
 
 def _inference_sweeps(cfg: DoubleWellAnalyticalConfig) -> Dict[str, Dict[str, Any]]:
+    # return {
+    #     "EviTrack-E":   dict(engine="evitrack",      K=15, C=3, G=1,
+    #                          expand="transition", prune_score="evidence",  weight_mode="evidence"),
+    #     "EviTrack-J":   dict(engine="evitrack",      K=15, C=3, G=1,
+    #                          expand="transition", prune_score="joint",     weight_mode="joint"),
+    #     "EviTrack-TBD": dict(engine="evitrack",      K=15, C=3, G=1,
+    #                          expand="transition", prune_score="tbd_joint", weight_mode="tbd_joint"),
+    #     "Bootstrap-PF": dict(engine="bootstrap_pf",  N=45),
+    #     "Random-Beam":  dict(engine="random_beam",   K=15, C=3, G=1,
+    #                          expand="transition"),
+    # }
     return {
-        "EviTrack-E":   dict(engine="evitrack",      K=5, C=3, G=1,
-                             expand="transition", prune_score="evidence",  weight_mode="evidence"),
-        "EviTrack-J":   dict(engine="evitrack",      K=5, C=3, G=1,
+        "EviTrack-J":   dict(engine="evitrack",      K=10, C=5, G=300,
                              expand="transition", prune_score="joint",     weight_mode="joint"),
-        "EviTrack-TBD": dict(engine="evitrack",      K=5, C=3, G=1,
-                             expand="transition", prune_score="tbd_joint", weight_mode="tbd_joint"),
-        "Bootstrap-PF": dict(engine="bootstrap_pf",  N=15),
-        "Random-Beam":  dict(engine="random_beam",   K=5, C=3, G=1,
+        "Bootstrap-PF": dict(engine="bootstrap_pf",  N=50),
+        "Random-Beam":  dict(engine="random_beam",   K=10, C=5, G=300,
                              expand="transition"),
     }
-    # Smoke Run with fewer configs (use for testing)
-    # return {
-    #     "EviTrack-E":   dict(engine="evitrack",      K=3, C=2, G=1,
-    #                          expand="transition", prune_score="evidence",  weight_mode="joint"),
-    #     "Bootstrap-PF": dict(engine="bootstrap_pf",  N=4),
-    # }
 
 
 def run_inference(

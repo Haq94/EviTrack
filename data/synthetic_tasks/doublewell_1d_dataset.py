@@ -94,7 +94,7 @@ def estimate_disambiguation_time_quadrature(
     n: int,
     sigma_x: float,
     z0_std: float,
-    threshold: float = 0.8,
+    threshold: float = 0.9,
     zmin: float = -4.0,
     zmax: float = 4.0,
     G: int = 1000,
@@ -150,7 +150,10 @@ def estimate_disambiguation_time_quadrature(
     neg_mask = z_grid < 0
 
     for t in range(T):
-        pt = p_pred[t]
+        # OLD (predictive):
+        # pt = p_pred[t]
+        # NEW (filtering):
+        pt = p_filt[t]
         m_pos = np.sum(pt[pos_mask]) * dz
         m_neg = np.sum(pt[neg_mask]) * dz
         mass_diff = m_pos - m_neg

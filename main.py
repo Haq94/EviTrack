@@ -55,7 +55,7 @@ RUN_ALL  = True
 EXP_NAME = "doublewell_analytical_inference"   # used when RUN_ALL = False
 
 # Folder name for organizing results
-FOLDER_NAME = "ablations_run_1"  # Change this for different runs (e.g., "main_run", "ablation_1")
+FOLDER_NAME = "smoker"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 RESULTS_DIR = f"results/{FOLDER_NAME}"
@@ -85,12 +85,12 @@ DOUBLEWELL_PARAMS = DoubleWellParams()
 
 # Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
-    (0, 40): 250,      # Early disambiguation
-    (40, 80): 250,     # Mid disambiguation
-    (80, 120): 250,    # Late disambiguation
-    (120, 200): 250,    # Very late disambiguation
+    (0, 40): 100,      # Early disambiguation
+    (40, 80): 100,     # Mid disambiguation
+    (80, 120): 100,    # Late disambiguation
+    (120, 200): 100,    # Very late disambiguation
 }
-# Disambiguation time bin targets for pruning ablation 
+# Disambiguation time bin targets for pruning ablation
 DD_TIME_BIN_TARGETS_PRUNING = {
     (0, 40):    100,
     (40, 80):   100,
@@ -253,11 +253,11 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
         z0_std=p.z0_std,
 
         # Inference
-        inference_seeds=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        inference_seeds=[0, 1],
 
         # Replay
-        horizons=[1, 5, 10, 20, 50],
-        n_rollout_samples=20,
+        horizons=[1, 5],
+        n_rollout_samples=10,
     )
 
 def _pruning_ablation_cfg() -> GlobalPruningAblationConfig:
@@ -366,12 +366,12 @@ def exp_doublewell_analytical_plots() -> None:
 
 
 REGISTRY: Dict[str, Any] = {
-    # "doublewell_analytical_inference": exp_doublewell_analytical_inference,
-    # "doublewell_analytical_replay":    exp_doublewell_analytical_replay,
-    "pruning_ablation_inference": exp_pruning_ablation_inference,
-    "pruning_ablation_replay":    exp_pruning_ablation_replay,
-    "budget_ablation_inference": exp_budget_ablation_inference,
-    "budget_ablation_replay":    exp_budget_ablation_replay,
+    "doublewell_analytical_inference": exp_doublewell_analytical_inference,
+    "doublewell_analytical_replay":    exp_doublewell_analytical_replay,
+    # "pruning_ablation_inference": exp_pruning_ablation_inference,
+    # "pruning_ablation_replay":    exp_pruning_ablation_replay,
+    # "budget_ablation_inference": exp_budget_ablation_inference,
+    # "budget_ablation_replay":    exp_budget_ablation_replay,
     # "doublewell_analytical_plots":     exp_doublewell_analytical_plots,
     # "doublewell_trained_inference":  exp_doublewell_trained_inference,
     # "doublewell_trained_replay":     exp_doublewell_trained_replay,

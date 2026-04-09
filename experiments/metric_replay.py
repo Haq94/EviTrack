@@ -44,16 +44,17 @@ from data.dataset_io import load_dataset
 
 @dataclass
 class ReplayConfig:
-    results_dir:       str
-    dataset_path:      str
-    engines:           List[str]
-    horizons:          List[int]
-    n_rollout_samples: int
-    device:            str         = "cpu"
-    dtype:             torch.dtype = torch.float32
-    save_dir:          str         = ""
-    verbose:           bool        = True
-    rollout_mode:      str         = "autoregressive"  # "autoregressive" | "frozen"
+    results_dir:            str
+    dataset_path:           str
+    engines:                List[str]
+    horizons:               List[int]
+    n_rollout_samples:      int
+    device:                 str         = "cpu"
+    dtype:                  torch.dtype = torch.float32
+    save_dir:               str         = ""
+    verbose:                bool        = True
+    rollout_mode:           str         = "autoregressive"  # "autoregressive" | "frozen"
+    dd_certainty_threshold: float  = 0.9  # Threshold for DD detection
 
 
 # ---------------------------------------------------------------
@@ -280,7 +281,7 @@ def compute_metrics_at_t(
     Returns dict with:
         "pll":              [num_horizons]
         "mse":              [num_horizons]
-        "branch_acc_per_h": [num_horizons]
+        "ba_per_h":         [num_horizons]
         "coverage_50":      [num_horizons]   (if 0.5 in coverage_levels)
         "coverage_90":      [num_horizons]   (if 0.9 in coverage_levels)
     """
@@ -290,7 +291,7 @@ def compute_metrics_at_t(
     num_horizons = len(horizons)
     pll        = np.full(num_horizons, np.nan)
     mse        = np.full(num_horizons, np.nan)
-    branch_acc = np.full(num_horizons, np.nan)
+    ba = np.full(num_horizons, np.nan)
 
     # coverage dict: level -> array [num_horizons]
     coverages = {lvl: np.full(num_horizons, np.nan) for lvl in coverage_levels}
@@ -326,12 +327,12 @@ def compute_metrics_at_t(
         # ---- Branch accuracy ----
         z_target_sign = np.sign(z_target[0])
         if z_target_sign == 0.0:
-            branch_acc[hi] = 1.0
+            ba[hi] = 1.0
         else:
             z_roll_h = z_rollout[:, :, h_idx, 0]                          # [K, M]
             correct_per_hyp = np.mean(
                 np.sign(z_roll_h) == z_target_sign, axis=1)               # [K]
-            branch_acc[hi] = float(np.sum(weights_t * correct_per_hyp))
+            ba[hi] = float(np.sum(weights_t * correct_per_hyp))
 
         # ---- Coverage ----
         # Build weighted sample set: K*M samples, each with weight w_k / M
@@ -372,7 +373,7 @@ def compute_metrics_at_t(
     result = {
         "pll":              pll,
         "mse":              mse,
-        "branch_acc_per_h": branch_acc,
+        "ba_per_h":         ba,
     }
     for lvl in coverage_levels:
         key = f"coverage_{int(lvl * 100)}"
@@ -396,7 +397,8 @@ def replay_single_trajectory(
     n_rollout_samples: int,
     device: torch.device,
     dtype: torch.dtype,
-    rollout_mode: str = "autoregressive",   # NEW
+    rollout_mode: str = "autoregressive",
+    dd_certainty_threshold: float = 0.9,  # NEW
 ) -> Dict[str, np.ndarray]:
     data     = dict(np.load(npz_path, allow_pickle=False))
     traj_idx = int(data["traj_index"])
@@ -412,15 +414,27 @@ def replay_single_trajectory(
     H_max        = max(horizons)
     num_horizons = len(horizons)
 
+    # Forecasting metrics (with horizon dimension)
     pll_all         = np.full((T, num_horizons), np.nan, dtype=np.float64)
     mse_all         = np.full((T, num_horizons), np.nan, dtype=np.float64)
-    branch_acc_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)
+    ba_all          = np.full((T, num_horizons), np.nan, dtype=np.float64)
     coverage_50_all = np.full((T, num_horizons), np.nan, dtype=np.float64)
     coverage_90_all = np.full((T, num_horizons), np.nan, dtype=np.float64)
 
-    p_positive_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)  # P(Z_{t+H} > 0)
-    p_negative_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)  # P(Z_{t+H} < 0)
-    ess_all         = np.full(T, np.nan, dtype=np.float64)                  # ESS at each t
+    # p_positive_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)  # P(Z_{t+H} > 0)
+    # p_negative_all  = np.full((T, num_horizons), np.nan, dtype=np.float64)  # P(Z_{t+H} < 0)
+
+    # Filtering metrics (no horizon dimension)
+    ess_all = np.full(T, np.nan, dtype=np.float64)
+    ba_filt_all = np.full(T, np.nan, dtype=np.float64)
+    p_positive_filt_all = np.full(T, np.nan, dtype=np.float64)
+    p_negative_filt_all = np.full(T, np.nan, dtype=np.float64)
+    bimodality_all = np.full(T, np.nan, dtype=np.float64)
+    brier_all = np.full(T, np.nan, dtype=np.float64)
+    latent_mse_all = np.full(T, np.nan, dtype=np.float64)
+    latent_bias_all = np.full(T, np.nan, dtype=np.float64)
+    latent_var_all = np.full(T, np.nan, dtype=np.float64)
+    dd_time_predicted = T  # Default: never disambiguated
 
     has_wm_z_state = "wm_z_state" in data
     has_wm_x_state = "wm_x_state" in data
@@ -430,6 +444,39 @@ def replay_single_trajectory(
         weights_t = np.exp(log_w[t])  # [K]
         weights_t = weights_t / (np.sum(weights_t) + 1e-12)  # Normalize
         ess_all[t] = 1.0 / (np.sum(weights_t ** 2) + 1e-12)
+
+        # NEW: Compute filtering metrics from current particles
+        z_t_particles = z_hyps[t, :, 0]  # [K]
+        z_t_true = z_true[t, 0]          # scalar
+        z_t_true_sign = np.sign(z_t_true)
+
+        # Weighted mean
+        z_mean = np.sum(weights_t * z_t_particles)
+
+        # 1. Branch probabilities
+        p_pos_filt = np.sum(weights_t * (z_t_particles > 0))
+        p_neg_filt = np.sum(weights_t * (z_t_particles < 0))
+        p_positive_filt_all[t] = p_pos_filt
+        p_negative_filt_all[t] = p_neg_filt
+
+        # 2. Bimodality
+        bimodality_all[t] = min(p_pos_filt, p_neg_filt)
+
+        # 3. Filtering branch accuracy
+        if z_t_true_sign != 0.0:
+            correct = (np.sign(z_t_particles) == z_t_true_sign)
+            ba_filt_all[t] = np.sum(weights_t * correct)
+        else:
+            ba_filt_all[t] = 1.0
+
+        # 4. Brier score
+        true_positive = float(z_t_true > 0)
+        brier_all[t] = (p_pos_filt - true_positive) ** 2
+
+        # 5. MSE decomposition
+        latent_mse_all[t] = np.sum(weights_t * (z_t_particles - z_t_true) ** 2)
+        latent_bias_all[t] = z_mean - z_t_true
+        latent_var_all[t] = np.sum(weights_t * (z_t_particles - z_mean) ** 2)
 
         remaining = T - t - 1
         if remaining < 1:
@@ -486,39 +533,62 @@ def replay_single_trajectory(
             full_idx = horizons.index(h)
             pll_all[t, full_idx]         = metrics["pll"][vi]
             mse_all[t, full_idx]         = metrics["mse"][vi]
-            branch_acc_all[t, full_idx]  = metrics["branch_acc_per_h"][vi]
+            ba_all[t, full_idx]          = metrics["ba_per_h"][vi]
             coverage_50_all[t, full_idx] = metrics["coverage_50"][vi]   # NEW
             coverage_90_all[t, full_idx] = metrics["coverage_90"][vi]   # NEW
 
-            # NEW: Compute branch probabilities
-            # z_roll_np is [K, M, H_max, dz]
-            h_idx = h - 1  # 0-indexed
-            if h_idx < z_roll_np.shape[2]:
-                z_roll_h = z_roll_np[:, :, h_idx, 0]  # [K, M] - position at horizon h
+    # Compute predicted DD time from filtering certainty
+    certainty = np.abs(p_positive_filt_all - p_negative_filt_all)
+    dd_mask = ~np.isnan(certainty) & (certainty >= dd_certainty_threshold)
 
-                # For each hypothesis k, what fraction of samples are positive?
-                frac_pos_per_hyp = np.mean(z_roll_h > 0, axis=1)  # [K]
-                frac_neg_per_hyp = np.mean(z_roll_h < 0, axis=1)  # [K]
+    if dd_mask.any():
+        dd_time_predicted = int(np.argmax(dd_mask))
+    else:
+        dd_time_predicted = T  # Never disambiguated
 
-                # Weight by hypothesis weights
-                weights_t_norm = np.exp(log_w[t])
-                weights_t_norm = weights_t_norm / (np.sum(weights_t_norm) + 1e-12)
+            # # NEW: Compute branch probabilities
+            # # z_roll_np is [K, M, H_max, dz]
+            # h_idx = h - 1  # 0-indexed
+            # if h_idx < z_roll_np.shape[2]:
+            #     z_roll_h = z_roll_np[:, :, h_idx, 0]  # [K, M] - position at horizon h
 
-                p_pos = np.sum(weights_t_norm * frac_pos_per_hyp)
-                p_neg = np.sum(weights_t_norm * frac_neg_per_hyp)
+            #     # For each hypothesis k, what fraction of samples are positive?
+            #     frac_pos_per_hyp = np.mean(z_roll_h > 0, axis=1)  # [K]
+            #     frac_neg_per_hyp = np.mean(z_roll_h < 0, axis=1)  # [K]
 
-                p_positive_all[t, full_idx] = p_pos
-                p_negative_all[t, full_idx] = p_neg
+            #     # Weight by hypothesis weights
+            #     weights_t_norm = np.exp(log_w[t])
+            #     weights_t_norm = weights_t_norm / (np.sum(weights_t_norm) + 1e-12)
+
+            #     p_pos = np.sum(weights_t_norm * frac_pos_per_hyp)
+            #     p_neg = np.sum(weights_t_norm * frac_neg_per_hyp)
+
+            #     p_positive_all[t, full_idx] = p_pos
+            #     p_negative_all[t, full_idx] = p_neg
 
     return {
-            "pll":         pll_all,
-            "mse":         mse_all,
-            "branch_acc":  branch_acc_all,
-            "coverage_50": coverage_50_all,
-            "coverage_90": coverage_90_all,
-            "p_positive":  p_positive_all,    # NEW
-            "p_negative":  p_negative_all,    # NEW
-            "ess":         ess_all,           # NEW
+            # Forecast metrics (with horizon dimension)
+            "pll":          pll_all,
+            "mse_obs":      mse_all,
+            "ba":           ba_all,
+            "coverage_50":  coverage_50_all,
+            "coverage_90":  coverage_90_all,
+            # "p_positive":  p_positive_all,
+            # "p_negative":  p_negative_all,
+
+            # Filtering metrics (no horizon dimension)
+            "ba_filt":              ba_filt_all,
+            "p_positive_filt":      p_positive_filt_all,
+            "p_negative_filt":      p_negative_filt_all,
+            "bimodality":           bimodality_all,
+            "brier":                brier_all,
+            "mse_filt":             latent_mse_all,
+            "bias_filt":            latent_bias_all,
+            "var_filt":             latent_var_all,
+            "ess":                  ess_all,
+            "dd_time_predicted":    dd_time_predicted,
+
+            # Metadata
             "traj_index":  traj_idx,
         }
 
@@ -568,7 +638,8 @@ def _replay_engine(
     n_rollout_samples: int,
     device: torch.device,
     dtype: torch.dtype,
-    rollout_mode: str = "autoregressive",   # NEW
+    rollout_mode: str = "autoregressive",
+    dd_certainty_threshold: float = 0.9,  # NEW
     verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
 
@@ -579,12 +650,22 @@ def _replay_engine(
 
     pll_accum         = []
     mse_accum         = []
-    branch_acc_accum  = []
+    ba_accum  = []
     coverage_50_accum = []
     coverage_90_accum = []
-    p_positive_accum  = []  # NEW
-    p_negative_accum  = []  # NEW
-    ess_accum         = []  # NEW
+
+    # Filtering metrics
+    ba_filt_accum           = []
+    p_positive_filt_accum   = []
+    p_negative_filt_accum   = []
+    bimodality_accum        = []
+    brier_accum             = []
+    latent_mse_accum        = []
+    latent_bias_accum       = []
+    latent_var_accum        = []
+    ess_accum               = []
+    dd_time_predicted_accum = []
+
     traj_indices      = []
     seed_indices      = []
 
@@ -594,9 +675,6 @@ def _replay_engine(
         for traj_file in traj_files:
             data = dict(np.load(traj_file, allow_pickle=False))
             traj_idx = int(data["traj_index"])
-
-            # x_i = x[traj_idx].numpy()
-            # z_i = z[traj_idx].numpy()
 
             result = replay_single_trajectory(
                 npz_path=traj_file,
@@ -608,16 +686,28 @@ def _replay_engine(
                 device=device,
                 dtype=dtype,
                 rollout_mode=rollout_mode,
+                dd_certainty_threshold=dd_certainty_threshold,  # NEW
             )
 
+            # Forecast metrics
             pll_accum.append(result["pll"])
-            mse_accum.append(result["mse"])
-            branch_acc_accum.append(result["branch_acc"])
+            mse_accum.append(result["mse_obs"])
+            ba_accum.append(result["ba"])
             coverage_50_accum.append(result["coverage_50"])
             coverage_90_accum.append(result["coverage_90"])
-            p_positive_accum.append(result["p_positive"])  # NEW
-            p_negative_accum.append(result["p_negative"])  # NEW
-            ess_accum.append(result["ess"])                # NEW
+
+            # Filtering metrics
+            ba_filt_accum.append(result["ba_filt"])
+            p_positive_filt_accum.append(result["p_positive_filt"])
+            p_negative_filt_accum.append(result["p_negative_filt"])
+            bimodality_accum.append(result["bimodality"])
+            brier_accum.append(result["brier"])
+            latent_mse_accum.append(result["mse_filt"])
+            latent_bias_accum.append(result["bias_filt"])
+            latent_var_accum.append(result["var_filt"])
+            ess_accum.append(result["ess"])
+            dd_time_predicted_accum.append(result["dd_time_predicted"])
+
             traj_indices.append(traj_idx)
             seed_indices.append(seed_idx)
 
@@ -625,14 +715,25 @@ def _replay_engine(
         return None
 
     return {
-        "pll":         np.stack(pll_accum, axis=0),
-        "mse":         np.stack(mse_accum, axis=0),
-        "branch_acc":  np.stack(branch_acc_accum, axis=0),
-        "coverage_50": np.stack(coverage_50_accum, axis=0),
-        "coverage_90": np.stack(coverage_90_accum, axis=0),
-        "p_positive":  np.stack(p_positive_accum, axis=0),  # NEW
-        "p_negative":  np.stack(p_negative_accum, axis=0),  # NEW
-        "ess":         np.stack(ess_accum, axis=0),         # NEW
+        # Forecast metrics
+        "pll":              np.stack(pll_accum, axis=0),
+        "mse_obs":          np.stack(mse_accum, axis=0),
+        "ba":               np.stack(ba_accum, axis=0),
+        "coverage_50":      np.stack(coverage_50_accum, axis=0),
+        "coverage_90":      np.stack(coverage_90_accum, axis=0),
+
+        # Filtering metrics
+        "ba_filt":          np.stack(ba_filt_accum, axis=0),
+        "p_positive_filt":  np.stack(p_positive_filt_accum, axis=0),
+        "p_negative_filt":  np.stack(p_negative_filt_accum, axis=0),
+        "bimodality":       np.stack(bimodality_accum, axis=0),
+        "brier":            np.stack(brier_accum, axis=0),
+        "mse_filt":         np.stack(latent_mse_accum, axis=0),
+        "bias_filt":        np.stack(latent_bias_accum, axis=0),
+        "var_filt":         np.stack(latent_var_accum, axis=0),
+        "ess":              np.stack(ess_accum, axis=0),
+        "dd_time_predicted": np.array(dd_time_predicted_accum, dtype=np.int64),
+
         "traj_index":  np.array(traj_indices, dtype=np.int64),
         "seed_index":  np.array(seed_indices, dtype=np.int64),
     }
@@ -699,6 +800,7 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
             device=device,
             dtype=dtype,
             rollout_mode=cfg.rollout_mode,
+            dd_certainty_threshold=cfg.dd_certainty_threshold,  # NEW
             verbose=cfg.verbose,
         )
 
@@ -710,6 +812,7 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
         traj_indices          = agg["traj_index"]
         agg["delayed_flag"]   = delayed_flag[traj_indices]
         agg["disamb_time"]    = disamb_time[traj_indices]
+        agg["dd_error"] = agg["dd_time_predicted"] - agg["disamb_time"]
 
         # CHANGED: output filename uses engine_name only, no k_tag or weight_mode
         out_name  = f"{engine_name}.npz"
@@ -720,18 +823,31 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
 
         np.savez_compressed(
             out_path,
+            # Forecast metrics (with horizon dimension)
             pll=agg["pll"],
-            mse=agg["mse"],
-            branch_acc=agg["branch_acc"],
+            mse_obs=agg["mse_obs"],
+            ba=agg["ba"],
             coverage_50=agg["coverage_50"],
             coverage_90=agg["coverage_90"],
-            p_positive=agg["p_positive"],    # NEW
-            p_negative=agg["p_negative"],    # NEW
-            ess=agg["ess"],                  # NEW
+
+            # Filtering metrics (no horizon dimension)
+            ba_filt=agg["ba_filt"],
+            p_positive_filt=agg["p_positive_filt"],
+            p_negative_filt=agg["p_negative_filt"],
+            bimodality=agg["bimodality"],
+            brier=agg["brier"],
+            latent_mse=agg["mse_filt"],
+            latent_bias=agg["bias_filt"],
+            latent_variance=agg["var_filt"],
+            ess=agg["ess"],
+            dd_time_predicted=agg["dd_time_predicted"],
+            dd_error=agg["dd_error"],
+
+            # Metadata
             traj_index=agg["traj_index"],
             seed_index=agg["seed_index"],
             delayed_flag=agg["delayed_flag"],
-            disamb_time=agg["disamb_time"],
+            dd_time_truth=agg["disamb_time"],
             horizons=np.array(horizons, dtype=np.int64),
             T=np.array(T, dtype=np.int64),
             engine_name=np.array(engine_name),
@@ -740,6 +856,28 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
             n_rollout_samples=np.array(cfg.n_rollout_samples, dtype=np.int64),
         )
 
+        # np.savez_compressed(
+        #     out_path,
+        #     pll=agg["pll"],
+        #     mse=agg["mse"],
+        #     branch_acc=agg["branch_acc"],
+        #     coverage_50=agg["coverage_50"],
+        #     coverage_90=agg["coverage_90"],
+        #     p_positive=agg["p_positive"],    # NEW
+        #     p_negative=agg["p_negative"],    # NEW
+        #     ess=agg["ess"],                  # NEW
+        #     traj_index=agg["traj_index"],
+        #     seed_index=agg["seed_index"],
+        #     delayed_flag=agg["delayed_flag"],
+        #     disamb_time=agg["disamb_time"],
+        #     horizons=np.array(horizons, dtype=np.int64),
+        #     T=np.array(T, dtype=np.int64),
+        #     engine_name=np.array(engine_name),
+        #     engine_cfg=np.array(json.dumps(engine_cfg)),
+        #     weight_mode=np.array(weight_mode_saved),
+        #     n_rollout_samples=np.array(cfg.n_rollout_samples, dtype=np.int64),
+        # )
+
         n_total       = agg["pll"].shape[0]
         n_delayed_cnt = int(agg["delayed_flag"].sum())
         n_non_delayed = n_total - n_delayed_cnt
@@ -747,8 +885,8 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
         if cfg.verbose:
             valid_mask = ~np.isnan(agg["pll"])
             mean_pll = np.nanmean(agg["pll"]) if valid_mask.any() else float("nan")
-            mean_mse = np.nanmean(agg["mse"]) if valid_mask.any() else float("nan")
-            mean_ba  = np.nanmean(agg["branch_acc"]) if valid_mask.any() else float("nan")
+            mean_mse = np.nanmean(agg["mse_obs"]) if valid_mask.any() else float("nan")
+            mean_ba  = np.nanmean(agg["ba"]) if valid_mask.any() else float("nan")
             print(f"  Saved: {out_path}")
             print(f"  Trajectories: {n_total} ({n_delayed_cnt} delayed, {n_non_delayed} non-delayed)")
             print(f"  Mean PLL: {mean_pll:.4f}  Mean MSE: {mean_mse:.6f}  Mean BA: {mean_ba:.4f}")
@@ -792,7 +930,7 @@ def stratify_by_delayed(
 
     Returns:
         (delayed_results, non_delayed_results) — each a dict with
-        pll, mse, branch_acc arrays sliced to the corresponding subset.
+        pll, mse, ba arrays sliced to the corresponding subset.
     """
     mask_d = results["delayed_flag"].astype(bool)
     mask_nd = ~mask_d
@@ -801,7 +939,7 @@ def stratify_by_delayed(
         return {
             "pll": results["pll"][m],
             "mse": results["mse"][m],
-            "branch_acc": results["branch_acc"][m],
+            "ba": results["ba"][m],
             "traj_index": results["traj_index"][m],
             "disamb_time": results["disamb_time"][m],
             "horizons": results["horizons"],
@@ -839,7 +977,7 @@ def stratify_by_disamb_bins(
             out[label] = {
                 "pll": results["pll"][mask],
                 "mse": results["mse"][mask],
-                "branch_acc": results["branch_acc"][mask],
+                "ba": results["ba"][mask],
                 "traj_index": results["traj_index"][mask],
                 "disamb_time": dt[mask],
                 "horizons": results["horizons"],
@@ -851,7 +989,7 @@ def stratify_by_disamb_bins(
         out["disamb_never"] = {
             "pll": results["pll"][mask_never],
             "mse": results["mse"][mask_never],
-            "branch_acc": results["branch_acc"][mask_never],
+            "ba": results["ba"][mask_never],
             "traj_index": results["traj_index"][mask_never],
             "disamb_time": dt[mask_never],
             "horizons": results["horizons"],

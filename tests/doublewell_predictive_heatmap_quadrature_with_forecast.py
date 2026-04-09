@@ -1,5 +1,5 @@
 # doublewell_predictive_heatmap_quadrature_with_forecast.py
-# Extends doublewell_predictive_heatmap_quadrature.py 
+# Extends doublewell_predictive_heatmap_quadrature.py
 # Adds a heatmap for p(x_{t+H} | x_{1:t}) via deterministic quadrature.
 
 import numpy as np
@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 # ============================================================
 SEEDS = [n for n in range(100)]          # keep small; this plots per-seed
 T = 200
-H = 30              # <-- forecast horizon: plot p(x_{t+H} | x_{1:t})
+H = 0              # <-- forecast horizon: plot p(x_{t+H} | x_{1:t})
 threshold = 0.8     # Threshold used to estimate disambiguation time
 
 # ---- Transition params ----
@@ -180,7 +180,7 @@ for seed in SEEDS:
     plt.show()
 
     # ------------------------------------------------------------
-    # 3B) Heatmap 1: p(z_t | x_<t)  
+    # 3B) Heatmap 1: p(z_t | x_<t)
     #     Here p_pred[t] corresponds to p(z_{t+1} | x_<t+1).
     #     So plotting p_pred as columns t=1..T is correct.
     # ------------------------------------------------------------
