@@ -55,7 +55,7 @@ RUN_ALL  = True
 EXP_NAME = "doublewell_analytical_inference"   # used when RUN_ALL = False
 
 # Folder name for organizing results
-FOLDER_NAME = "smoker"  # Change this for different runs (e.g., "main_run", "ablation_1")
+FOLDER_NAME = "delete_3"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 RESULTS_DIR = f"results/{FOLDER_NAME}"
@@ -78,17 +78,17 @@ class DoubleWellParams:
     sigma_x: float = 0.12
     z0_mean: float = 0.0
     z0_std: float = 1.0
-    threshold: float = 0.8
+    threshold: float = 0.9
 
 # Global instance
 DOUBLEWELL_PARAMS = DoubleWellParams()
 
 # Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
-    (0, 40): 100,      # Early disambiguation
-    (40, 80): 100,     # Mid disambiguation
-    (80, 120): 100,    # Late disambiguation
-    (120, 200): 100,    # Very late disambiguation
+    (0, 40): 20,      # Early disambiguation
+    (40, 80): 20,     # Mid disambiguation
+    (80, 120): 20,    # Late disambiguation
+    (120, 200): 20,    # Very late disambiguation
 }
 # Disambiguation time bin targets for pruning ablation
 DD_TIME_BIN_TARGETS_PRUNING = {
@@ -253,11 +253,11 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
         z0_std=p.z0_std,
 
         # Inference
-        inference_seeds=[0, 1],
+        inference_seeds=[0,1],
 
         # Replay
-        horizons=[1, 5],
-        n_rollout_samples=10,
+        horizons=[1],
+        n_rollout_samples=1,
     )
 
 def _pruning_ablation_cfg() -> GlobalPruningAblationConfig:

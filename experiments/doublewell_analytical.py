@@ -118,11 +118,11 @@ def _inference_sweeps(cfg: DoubleWellAnalyticalConfig) -> Dict[str, Dict[str, An
     #                          expand="transition"),
     # }
     return {
-        "EviTrack-J":   dict(engine="evitrack",      K=10, C=5, G=300,
+        "EviTrack-J":   dict(engine="evitrack",      K=32, C=2, G=10,
                              expand="transition", prune_score="joint",     weight_mode="joint"),
-        "Bootstrap-PF": dict(engine="bootstrap_pf",  N=50),
-        "Random-Beam":  dict(engine="random_beam",   K=10, C=5, G=300,
-                             expand="transition"),
+        "Bootstrap-PF": dict(engine="bootstrap_pf",  N=64, resample_every_step=False, ess_threshold_frac=0.5),
+        "Random-Beam":  dict(engine="random_beam",   K=32, C=2, G=10,
+                             expand="transition", weight_mode="joint"),
     }
 
 

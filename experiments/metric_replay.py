@@ -121,13 +121,18 @@ def compute_log_weights(
     if type_id == 1:
         return compute_weights_particle(npz)
 
-    # Random beam: uniform weights over retained hypotheses
+    # Random beam: check weight_mode
     engine_name = str(engine_cfg.get("engine", "")).lower()
     if engine_name == "random_beam":
-        K = npz["z"].shape[1]   # z has shape [T, K, dz]
-        T = npz["z"].shape[0]
-        logw = np.full((T, K), -math.log(K), dtype=np.float64)
-        return logw
+        weight_mode = engine_cfg.get("weight_mode", "uniform")
+        if weight_mode == "uniform":
+            K = npz["z"].shape[1]
+            T = npz["z"].shape[0]
+            logw = np.full((T, K), -math.log(K), dtype=np.float64)
+            return logw
+        else:
+            # Use evidence/joint/tbd scores like EviTrack
+            return compute_weights_evitrack(npz, weight_mode)
 
     # EviTrack
     weight_mode = engine_cfg["weight_mode"]

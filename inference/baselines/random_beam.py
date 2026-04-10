@@ -19,8 +19,10 @@ class RandomBeamConfig:
     C: int
     tau: int = 1
     G: int = 1
-    expand: str = "proposal"   # "proposal" or "transition"
-    replace: bool = False      # global prune: sample with replacement?
+    expand: str = "transition"          # "proposal" or "transition"
+    replace: bool = False               # global prune: sample with replacement?
+    sigma_bg: float = 1.0               # std dev for background latent distribution used in J_tbd calculation
+    weight_mode: str = "uniform"        # "uniform" | "evidence" | "joint" | "tbd_joint"
 
 
 class RandomBeamEngine(InferenceEngine):
@@ -37,6 +39,7 @@ class RandomBeamEngine(InferenceEngine):
     def __init__(self, *, wm, proposal, cfg: RandomBeamConfig):
         super().__init__(wm=wm, proposal=proposal, cfg=cfg)
         assert cfg.expand in ("proposal", "transition")
+        assert cfg.weight_mode in ("uniform", "evidence", "joint", "tbd_joint")
         assert cfg.K >= 1
         assert cfg.C >= 1
         assert cfg.tau >= 1
@@ -156,12 +159,16 @@ class RandomBeamEngine(InferenceEngine):
 
     def get_mixture(self, state: EviTrackState):
         """
-        Uniform mixture over retained hypotheses.
+        Mixture over retained hypotheses.
+
+        weight_mode="uniform": uniform weights
+        weight_mode="evidence"|"joint"|"tbd_joint": use accumulated scores
 
         Returns:
             w: [B, K]
             support: List[List[Hypothesis]]
         """
+        cfg = self.cfg
         B = len(state.hyps)
         assert B > 0
 
@@ -172,7 +179,22 @@ class RandomBeamEngine(InferenceEngine):
         device = state.hyps[0][0].E.device
         dtype = state.hyps[0][0].E.dtype
 
-        logw = torch.zeros((B, K), device=device, dtype=dtype)
+        if cfg.weight_mode == "uniform":
+            logw = torch.zeros((B, K), device=device, dtype=dtype)
+        else:
+            logw = torch.empty((B, K), device=device, dtype=dtype)
+            for b in range(B):
+                for k in range(K):
+                    h = state.hyps[b][k]
+                    if cfg.weight_mode == "evidence":
+                        logw[b, k] = h.E
+                    elif cfg.weight_mode == "joint":
+                        logw[b, k] = h.J
+                    elif cfg.weight_mode == "tbd_joint":
+                        logw[b, k] = h.J_tbd
+                    else:
+                        raise ValueError(f"Unknown weight_mode={cfg.weight_mode}")
+
         w = normalize_logweights(logw, dim=1)
         return w, state.hyps
 
@@ -255,7 +277,12 @@ class RandomBeamEngine(InferenceEngine):
         # ---------------------------------------------------
         E_t = E_prev + logpxt.squeeze()
         J_t = J_prev + (logpxt + logpzt).squeeze()
-        J_tbd = J_tbd_prev + (logpxt + logpzt).squeeze()
+        if t == 1:
+            logp_bg_z1 = self._log_prob_bg_initial(z_t)
+            J_tbd = J_tbd_prev + (logpxt + logpzt - logp_bg_z1).squeeze()
+        else:
+            logp_bg_zt = self._log_prob_bg_transition(z_t, z_prev)
+            J_tbd = J_tbd_prev + (logpxt + logpzt - logp_bg_zt).squeeze()
 
         # ---------------------------------------------------
         # 5) Update stored WM states AFTER observing (z_t, x_t)
@@ -320,3 +347,39 @@ class RandomBeamEngine(InferenceEngine):
             kept.append(g[j])
 
         return kept
+
+    def _log_prob_bg_initial(self, z_1: Tensor) -> Tensor:
+        sigma = float(self.cfg.sigma_bg)
+        dz = z_1.shape[-1]
+        sq = torch.sum(z_1 * z_1, dim=-1)
+        log_norm = dz * torch.log(
+            torch.tensor(2.0 * torch.pi * sigma * sigma, device=z_1.device, dtype=z_1.dtype)
+        )
+        return -0.5 * (sq / (sigma * sigma) + log_norm)
+
+    def _log_prob_bg_transition(
+        self,
+        z_t: Tensor,
+        z_prev: Tensor,
+        ) -> Tensor:
+        """
+        Background latent dynamics:
+            p_bg(z_t | z_{t-1}) = N(z_{t-1}, sigma_bg^2 I)
+
+        Args:
+            z_t:    [1, dz]
+            z_prev: [1, dz]
+
+        Returns:
+            logp_bg: [1]
+        """
+        sigma = float(self.cfg.sigma_bg)
+        dz = z_t.shape[-1]
+
+        diff = z_t - z_prev
+        sq = torch.sum(diff * diff, dim=-1)  # [1]
+
+        log_norm = dz * torch.log(
+            torch.tensor(2.0 * torch.pi * sigma * sigma, device=z_t.device, dtype=z_t.dtype)
+        )
+        return -0.5 * (sq / (sigma * sigma) + log_norm)

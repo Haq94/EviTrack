@@ -46,10 +46,13 @@ def _engine_from_spec(cfg_dict: Dict[str, Any], wm, proposal):
     if engine == "bootstrap_pf":
         return BPFEngine(wm=wm, cfg=BPFConfig(**cfg_dict))
     if engine == "random_beam":
-        return RandomBeamEngine(
-            wm=wm, proposal=proposal,
-            cfg=RandomBeamConfig(**cfg_dict),
-        )
+            return RandomBeamEngine(
+                wm=wm, proposal=proposal,
+                cfg=RandomBeamConfig(
+                    weight_mode=weight_mode if weight_mode else "uniform",
+                    **cfg_dict,
+                ),
+            )
     if engine == "sis":
         # SIS requires a proposal
         assert proposal is not None, "SIS requires a proposal"
