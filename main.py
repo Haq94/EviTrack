@@ -55,7 +55,7 @@ RUN_ALL  = True
 EXP_NAME = "doublewell_analytical_inference"   # used when RUN_ALL = False
 
 # Folder name for organizing results
-FOLDER_NAME = "delete_3"  # Change this for different runs (e.g., "main_run", "ablation_1")
+FOLDER_NAME = "delete_4"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 RESULTS_DIR = f"results/{FOLDER_NAME}"
@@ -85,10 +85,10 @@ DOUBLEWELL_PARAMS = DoubleWellParams()
 
 # Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
-    (0, 40): 20,      # Early disambiguation
-    (40, 80): 20,     # Mid disambiguation
-    (80, 120): 20,    # Late disambiguation
-    (120, 200): 20,    # Very late disambiguation
+    (0, 40): 0,      # Early disambiguation
+    (40, 80): 0,     # Mid disambiguation
+    (80, 120): 2,    # Late disambiguation
+    (120, 200): 0,    # Very late disambiguation
 }
 # Disambiguation time bin targets for pruning ablation
 DD_TIME_BIN_TARGETS_PRUNING = {
