@@ -55,7 +55,7 @@ RUN_ALL  = True
 EXP_NAME = "doublewell_analytic_exp"   # used when RUN_ALL = False
 
 # Folder name for organizing results
-FOLDER_NAME = "delellelel"  # Change this for different runs (e.g., "main_run", "ablation_1")
+FOLDER_NAME = "EVITRACK_JOINT_GLOBAL_PRUNE_COMP_1"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 RESULTS_DIR = f"results/{FOLDER_NAME}"
@@ -85,10 +85,10 @@ DOUBLEWELL_PARAMS = DoubleWellParams()
 
 # Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
-    (0, 40): 1,      # Early disambiguation
-    (40, 80): 0,     # Mid disambiguation
-    (80, 120): 0,    # Late disambiguation
-    (120, 200): 0,    # Very late disambiguation
+    (0, 40): 25,      # Early disambiguation
+    (40, 80): 25,     # Mid disambiguation
+    (80, 120): 25,    # Late disambiguation
+    (120, 200): 25,    # Very late disambiguation
 }
 # Disambiguation time bin targets for pruning ablation
 DD_TIME_BIN_TARGETS_PRUNING = {
@@ -253,11 +253,11 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
         z0_std=p.z0_std,
 
         # Inference
-        inference_seeds=[4, 5],
+        inference_seeds=[2, 3],
 
         # Replay
-        horizons=[1],
-        n_rollout_samples=1,
+        horizons=[1, 5, 10],
+        n_rollout_samples=20,
     )
 
 def _pruning_ablation_cfg() -> GlobalPruningAblationConfig:
@@ -366,7 +366,7 @@ def exp_doublewell_analytical_plots() -> None:
 
 
 REGISTRY: Dict[str, Any] = {
-    "doublewell_analytical_inference": exp_doublewell_analytical_inference,
+    # "doublewell_analytical_inference": exp_doublewell_analytical_inference,
     "doublewell_analytical_replay":    exp_doublewell_analytical_replay,
     # "pruning_ablation_inference": exp_pruning_ablation_inference,
     # "pruning_ablation_replay":    exp_pruning_ablation_replay,

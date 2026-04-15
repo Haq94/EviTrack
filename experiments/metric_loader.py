@@ -157,6 +157,7 @@ class MetricLoader:
                     'latent_bias': result['latent_bias'][i, :],
                     'latent_variance': result['latent_variance'][i, :],
                     'ess': result['ess'][i, :],
+                    'entropy': result['entropy'][i, :],
 
                     # DD metrics
                     'dd_time_predicted': int(result['dd_time_predicted'][i]),
