@@ -107,27 +107,71 @@ def build_wm(cfg: DoubleWellAnalyticalConfig) -> AnalyticalWorldModel:
 
 def _inference_sweeps(cfg: DoubleWellAnalyticalConfig) -> Dict[str, Dict[str, Any]]:
     # return {
-    #     "EviTrack-E":   dict(engine="evitrack",      K=15, C=3, G=1,
-    #                          expand="transition", prune_score="evidence",  weight_mode="evidence"),
-    #     "EviTrack-J":   dict(engine="evitrack",      K=15, C=3, G=1,
-    #                          expand="transition", prune_score="joint",     weight_mode="joint"),
-    #     "EviTrack-TBD": dict(engine="evitrack",      K=15, C=3, G=1,
-    #                          expand="transition", prune_score="tbd_joint", weight_mode="tbd_joint"),
-    #     "Bootstrap-PF": dict(engine="bootstrap_pf",  N=45),
-    #     "Random-Beam":  dict(engine="random_beam",   K=15, C=3, G=1,
-    #                          expand="transition"),
+    #     "EviTrack-E-ESS": dict(
+    #         engine="evitrack", K=32, C=2,
+    #         expand="transition", prune_score="evidence", weight_mode="evidence",
+    #         use_ess_trigger=True, ess_threshold_frac=0.5),
+    #     "EviTrack-J-ESS": dict(
+    #         engine="evitrack", K=32, C=2,
+    #         expand="transition", prune_score="joint", weight_mode="joint",
+    #         use_ess_trigger=True, ess_threshold_frac=0.5),
+    #     "EviTrack-TBD-ESS": dict(
+    #         engine="evitrack", K=32, C=2,
+    #         expand="transition", prune_score="tbd_joint", weight_mode="tbd_joint",
+    #         use_ess_trigger=True, ess_threshold_frac=0.5),
+    #     "Bootstrap-PF": dict(engine="bootstrap_pf",  N=64, resample_every_step=False, ess_threshold_frac=0.5),
+    #     "SIS-PF": dict(engine="bootstrap_pf",  N=64, resample_every_step=False, ess_threshold_frac=0.0),
+    #     "Random-Beam":  dict(engine="random_beam",   K=32, C=2, G=1,
+    #                          expand="transition", weight_mode="joint"),
     # }
     return {
-        # "EviTrack-J":   dict(engine="evitrack",      K=32, C=2, G=10,
-        #                      expand="transition", prune_score="joint",     weight_mode="joint"),
-        # "Bootstrap-PF": dict(engine="bootstrap_pf",  N=64, resample_every_step=False, ess_threshold_frac=0.5),
-        # "Random-Beam":  dict(engine="random_beam",   K=32, C=2, G=10,
-        #                      expand="transition", weight_mode="joint"),
-        "EviTrack-J-ESS": dict(
-            engine="evitrack", K=32, C=2,
-            expand="transition", prune_score="joint", weight_mode="joint",
-            use_ess_trigger=True, ess_threshold_frac=0.5)
-    }
+    "EviTrack-J-Ginf": dict(
+        engine="evitrack",
+        K=32, C=2, G=10**9,
+        expand="transition",
+        prune_score="joint",
+        weight_mode="joint",
+        global_trigger_mode="constant",
+        global_trigger_source="parents",
+    ),
+
+    "EviTrack-J-MaxW": dict(
+        engine="evitrack",
+        K=32, C=2,
+        expand="transition",
+        prune_score="joint",
+        weight_mode="joint",
+        global_trigger_mode="max",
+        global_trigger_source="parents",
+        max_weight_threshold=0.90,
+    ),
+
+    "EviTrack-J-Entropy": dict(
+        engine="evitrack",
+        K=32, C=2,
+        expand="transition",
+        prune_score="joint",
+        weight_mode="joint",
+        global_trigger_mode="entropy",
+        global_trigger_source="parents",
+        entropy_threshold=0.20,
+        normalize_entropy=True,
+    ),
+
+    # "Bootstrap-PF": dict(
+    #     engine="bootstrap_pf",
+    #     N=64,
+    #     resample_every_step=False,
+    #     ess_threshold_frac=0.5
+    # ),
+
+    # "Random-Beam": dict(
+    #     engine="random_beam",
+    #     K=32, C=2, G=1,
+    #     expand="transition",
+    #     weight_mode="joint"
+    # ),
+}
 
 
 def run_inference(

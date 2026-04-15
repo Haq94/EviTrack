@@ -52,10 +52,10 @@ from experiments.inference_budget_ablation import (
 # ============================================================
 
 RUN_ALL  = True
-EXP_NAME = "doublewell_analytical_inference"   # used when RUN_ALL = False
+EXP_NAME = "doublewell_analytic_exp"   # used when RUN_ALL = False
 
 # Folder name for organizing results
-FOLDER_NAME = "delete_4"  # Change this for different runs (e.g., "main_run", "ablation_1")
+FOLDER_NAME = "delellelel"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 RESULTS_DIR = f"results/{FOLDER_NAME}"
@@ -85,9 +85,9 @@ DOUBLEWELL_PARAMS = DoubleWellParams()
 
 # Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
-    (0, 40): 0,      # Early disambiguation
+    (0, 40): 1,      # Early disambiguation
     (40, 80): 0,     # Mid disambiguation
-    (80, 120): 2,    # Late disambiguation
+    (80, 120): 0,    # Late disambiguation
     (120, 200): 0,    # Very late disambiguation
 }
 # Disambiguation time bin targets for pruning ablation
@@ -253,7 +253,7 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
         z0_std=p.z0_std,
 
         # Inference
-        inference_seeds=[0,1],
+        inference_seeds=[4, 5],
 
         # Replay
         horizons=[1],

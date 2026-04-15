@@ -8,7 +8,7 @@ import torch
 from .base import InferenceEngine
 from .types import Hypothesis, EviTrackState, StepStats, CostCounter
 from .utils import topk_per_batch, stack_scores, normalize_logweights
-from .resampling import effective_sample_size
+# from .resampling import effective_sample_size
 
 Tensor = torch.Tensor
 
@@ -18,11 +18,21 @@ Tensor = torch.Tensor
 #     K: int
 #     C: int
 #     tau: int = 1
-#     G: int = 1                 # every G steps do GLOBAL prune; otherwise LOCAL prune
-#     local_keep: Optional[int] = None  # how many children to keep per parent during LOCAL prune (<= C). default: min(C,K)
-#     expand: str = "proposal"   # "proposal" or "transition"
-#     prune_score: str = "evidence"  # "evidence" or "joint"
-#     weight_mode: str = "evidence"   # "evidence" or "joint"
+#     G: int = 1
+#     expand: str = "transition"      # "proposal" or "transition"
+
+#     # scoring used for pruning
+#     prune_score: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
+
+#     # scoring used for predictive mixture weights
+#     weight_mode: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
+
+#     # background latent random-walk std for TBD score
+#     sigma_bg: float = 1.0
+
+#     # ESS-based adaptive global pruning (alternative to fixed G)
+#     use_ess_trigger: bool = False
+#     ess_threshold_frac: float = 0.5  # trigger global pruning when ESS < ess_threshold_frac * K
 
 @dataclass
 class EviTrackConfig:
@@ -33,17 +43,25 @@ class EviTrackConfig:
     expand: str = "transition"      # "proposal" or "transition"
 
     # scoring used for pruning
-    prune_score: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
+    prune_score: str = "evidence"   # "evidence" | "joint" | "tbd_joint"
 
     # scoring used for predictive mixture weights
-    weight_mode: str = "evidence"  # "evidence" | "joint" | "tbd_joint"
+    weight_mode: str = "evidence"   # "evidence" | "joint" | "tbd_joint"
 
     # background latent random-walk std for TBD score
     sigma_bg: float = 1.0
 
-    # ESS-based adaptive global pruning (alternative to fixed G)
-    use_ess_trigger: bool = False
-    ess_threshold_frac: float = 0.5  # trigger global pruning when ESS < ess_threshold_frac * K
+    # Global pruning trigger
+    global_trigger_mode: str = "constant"   # "constant" | "max" | "entropy"
+    global_trigger_source: str = "parents"  # "parents" | "children"
+
+    # Used when global_trigger_mode == "max"
+    max_weight_threshold: float = 0.9
+
+    # Used when global_trigger_mode == "entropy"
+    entropy_threshold: float = 0.2          # normalized entropy threshold
+    normalize_entropy: bool = True
+
 
 class EviTrackEngine(InferenceEngine):
     def __init__(self, *, wm, proposal, cfg: EviTrackConfig):
@@ -52,6 +70,11 @@ class EviTrackEngine(InferenceEngine):
         assert cfg.prune_score in ("evidence", "joint", "tbd_joint")
         assert cfg.weight_mode in ("evidence", "joint", "tbd_joint")
         assert cfg.sigma_bg > 0.0, "sigma_bg must be positive."
+
+        assert cfg.global_trigger_mode in ("constant", "max", "entropy")
+        assert cfg.global_trigger_source in ("parents", "children")
+        assert 0.0 < cfg.max_weight_threshold <= 1.0
+        assert cfg.entropy_threshold >= 0.0
         if cfg.expand == "proposal":
             assert proposal is not None, "proposal required for expand='proposal'"
 
@@ -163,7 +186,8 @@ class EviTrackEngine(InferenceEngine):
         # NOTE: remove tau logic later if you want no prune delay.
         do_prune = (t_new % cfg.tau == 0)
         if do_prune:
-            kept = self.prune(t_new=t_new, candidate_groups=candidate_groups)
+            # kept = self.prune(t_new=t_new, candidate_groups=candidate_groups)
+            kept = self.prune(t_new=t_new, candidate_groups=candidate_groups, parent_beam=beam)
         else:
             kept = [c for g in candidate_groups for c in g]
 
@@ -333,62 +357,113 @@ class EviTrackEngine(InferenceEngine):
     # ------------------------
     # internal: pruning
     # ------------------------
-    def prune(self, *, t_new: int, candidate_groups: List[List[Hypothesis]]) -> List[Hypothesis]:
+    def _get_score(self, h: Hypothesis, mode: str) -> Tensor:
+        if mode == "joint":
+            return h.J
+        if mode == "evidence":
+            return h.E
+        if mode == "tbd_joint":
+            return h.J_tbd
+        raise ValueError(f"Unknown score mode={mode}")
+
+    def _normalized_weights_from_hyps(self, hyps: List[Hypothesis], mode: str) -> Tensor:
+        logw = torch.stack([self._get_score(h, mode) for h in hyps], dim=0)  # [N]
+        return normalize_logweights(logw, dim=0)
+
+    def _entropy_from_weights(self, w: Tensor) -> Tensor:
+        eps = 1e-12
+        w_safe = w.clamp_min(eps)
+        H = -(w_safe * torch.log(w_safe)).sum()
+
+        if self.cfg.normalize_entropy:
+            N = w.numel()
+            if N <= 1:
+                return torch.zeros((), device=w.device, dtype=w.dtype)
+            H_max = torch.log(torch.tensor(float(N), device=w.device, dtype=w.dtype))
+            return H / H_max
+
+        return H
+
+    def prune(
+        self,
+        *,
+        t_new: int,
+        candidate_groups: List[List[Hypothesis]],
+        parent_beam: List[Hypothesis],
+    ) -> List[Hypothesis]:
         """
         candidate_groups: list of groups, one per parent.
         group_i = children of parent i  (length C)
 
-        LOCAL (default between globals):
-        each parent keeps its top-1 child (by score)
+        parent_beam: current retained beam before expansion
 
-        GLOBAL (triggered by fixed G or adaptive ESS):
-        flatten all children and keep top-K
+        LOCAL:
+            keep best child per parent
 
-        ESS trigger: compute ESS from current beam weights and trigger global
-        pruning when ESS < ess_threshold_frac * K
+        GLOBAL:
+            flatten all children and keep top-K
+
+        Trigger modes:
+            - constant: use fixed G
+            - max: trigger global if max normalized weight exceeds threshold
+            - entropy: trigger global if normalized entropy drops below threshold
+
+        Trigger sources:
+            - parents: compute trigger statistic on current beam
+            - children: compute trigger statistic on candidate pool
         """
         cfg = self.cfg
 
-        def get_score(h: Hypothesis, mode: str) -> Tensor:
-            """Get score from hypothesis based on specified mode."""
-            if mode == "joint":
-                return h.J
-            if mode == "evidence":
-                return h.E
-            if mode == "tbd_joint":
-                return h.J_tbd
-            raise ValueError(f"Unknown score mode={mode}")
+        all_cands = [c for g in candidate_groups for c in g]
 
-        # Determine if we should do global pruning
-        if cfg.use_ess_trigger:
-            # Adaptive ESS-based trigger
-            # Compute ESS from candidate weights
-            all_cands = [c for g in candidate_groups for c in g]
-
-            # Compute weights from scores
-            logw = torch.stack([get_score(c, cfg.weight_mode) for c in all_cands], dim=0)  # [N_cand]
-            w = normalize_logweights(logw, dim=0)
-            ess = effective_sample_size(w)
-
-            # Trigger global pruning if ESS is low
-            do_global = (t_new == 1) or (ess < cfg.ess_threshold_frac * cfg.K)
+        # ---------------------------------------------------
+        # Decide trigger set: parents or children
+        # ---------------------------------------------------
+        if cfg.global_trigger_source == "parents":
+            trigger_hyps = parent_beam
+        elif cfg.global_trigger_source == "children":
+            trigger_hyps = all_cands
         else:
-            # Fixed-frequency global pruning (original behavior)
+            raise ValueError(f"Unknown global_trigger_source={cfg.global_trigger_source}")
+
+        # ---------------------------------------------------
+        # Determine if we should do global pruning
+        # ---------------------------------------------------
+        if cfg.global_trigger_mode == "constant":
             do_global = (t_new == 1) or (t_new % cfg.G == 0)
 
+        else:
+            w_trigger = self._normalized_weights_from_hyps(trigger_hyps, cfg.weight_mode)
+
+            if cfg.global_trigger_mode == "max":
+                max_w = torch.max(w_trigger)
+                do_global = (t_new == 1) or (max_w > cfg.max_weight_threshold)
+
+            elif cfg.global_trigger_mode == "entropy":
+                H = self._entropy_from_weights(w_trigger)
+                do_global = (t_new == 1) or (H < cfg.entropy_threshold)
+
+            else:
+                raise ValueError(f"Unknown global_trigger_mode={cfg.global_trigger_mode}")
+
+        # ---------------------------------------------------
+        # Global prune: top-K over all children
+        # ---------------------------------------------------
         if do_global:
-            all_cands = [c for g in candidate_groups for c in g]
-            scores = torch.stack([get_score(c, cfg.prune_score) for c in all_cands], dim=0)  # [Ncand]
+            scores = torch.stack([self._get_score(c, cfg.prune_score) for c in all_cands], dim=0)
             K_eff = min(cfg.K, scores.shape[0])
             idx = torch.topk(scores, k=K_eff, largest=True).indices.tolist()
             return [all_cands[i] for i in idx]
 
-        # local: keep best child per parent
+        # ---------------------------------------------------
+        # Local prune: best child per parent
+        # ---------------------------------------------------
         kept = []
         for g in candidate_groups:
-            scores = torch.stack([get_score(c, cfg.prune_score) for c in g], dim=0)  # [C]
+            scores = torch.stack([self._get_score(c, cfg.prune_score) for c in g], dim=0)
             best = int(torch.argmax(scores).item())
             kept.append(g[best])
+
         return kept
 
     # def prune(self, *, t_new: int, candidate_groups: List[List[Hypothesis]]) -> List[Hypothesis]:
@@ -399,24 +474,44 @@ class EviTrackEngine(InferenceEngine):
     #     LOCAL (default between globals):
     #     each parent keeps its top-1 child (by score)
 
-    #     GLOBAL (every G steps):
+    #     GLOBAL (triggered by fixed G or adaptive ESS):
     #     flatten all children and keep top-K
+
+    #     ESS trigger: compute ESS from current beam weights and trigger global
+    #     pruning when ESS < ess_threshold_frac * K
     #     """
     #     cfg = self.cfg
-    #     do_global = (t_new == 1) or (t_new % cfg.G == 0)
 
-    #     def get_score(h: Hypothesis) -> Tensor:
-    #         if cfg.prune_score == "joint":
-    #             return h.J
-    #         if cfg.prune_score == "evidence":
-    #             return h.E
-    #         if cfg.prune_score == "tbd_joint":
-    #             return h.J_tbd
-    #         raise ValueError(f"Unknown prune_score={cfg.prune_score}")
+    #     # def get_score(h: Hypothesis, mode: str) -> Tensor:
+    #     #     """Get score from hypothesis based on specified mode."""
+    #     #     if mode == "joint":
+    #     #         return h.J
+    #     #     if mode == "evidence":
+    #     #         return h.E
+    #     #     if mode == "tbd_joint":
+    #     #         return h.J_tbd
+    #     #     raise ValueError(f"Unknown score mode={mode}")
+
+    #     # Determine if we should do global pruning
+    #     if cfg.use_ess_trigger:
+    #         # Adaptive ESS-based trigger
+    #         # Compute ESS from candidate weights
+    #         all_cands = [c for g in candidate_groups for c in g]
+
+    #         # Compute weights from scores
+    #         logw = torch.stack([self._get_score(c, cfg.weight_mode) for c in all_cands], dim=0)  # [N_cand]
+    #         w = normalize_logweights(logw, dim=0)
+    #         ess = effective_sample_size(w)
+
+    #         # Trigger global pruning if ESS is low
+    #         do_global = (t_new == 1) or (ess < cfg.ess_threshold_frac * cfg.K)
+    #     else:
+    #         # Fixed-frequency global pruning (original behavior)
+    #         do_global = (t_new == 1) or (t_new % cfg.G == 0)
 
     #     if do_global:
     #         all_cands = [c for g in candidate_groups for c in g]
-    #         scores = torch.stack([get_score(c) for c in all_cands], dim=0)  # [Ncand]
+    #         scores = torch.stack([self._get_score(c, cfg.prune_score) for c in all_cands], dim=0)  # [Ncand]
     #         K_eff = min(cfg.K, scores.shape[0])
     #         idx = torch.topk(scores, k=K_eff, largest=True).indices.tolist()
     #         return [all_cands[i] for i in idx]
@@ -424,7 +519,7 @@ class EviTrackEngine(InferenceEngine):
     #     # local: keep best child per parent
     #     kept = []
     #     for g in candidate_groups:
-    #         scores = torch.stack([get_score(c) for c in g], dim=0)  # [C]
+    #         scores = torch.stack([self._get_score(c, cfg.prune_score) for c in g], dim=0)  # [C]
     #         best = int(torch.argmax(scores).item())
     #         kept.append(g[best])
     #     return kept

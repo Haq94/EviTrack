@@ -68,6 +68,26 @@ def _log_softmax(logits: np.ndarray) -> np.ndarray:
     lse = np.log(np.sum(np.exp(shifted), axis=-1, keepdims=True))
     return shifted - lse
 
+def _normalized_entropy(weights: np.ndarray, eps: float = 1e-12) -> float:
+    """
+    Normalized entropy in [0, 1].
+
+    weights: [K], assumed nonnegative and approximately normalized.
+    returns:
+        0.0 -> fully collapsed on one hypothesis
+        1.0 -> uniform over hypotheses
+    """
+    w = np.asarray(weights, dtype=np.float64)
+    w = w / (np.sum(w) + eps)
+    w = np.clip(w, eps, 1.0)
+
+    H = -np.sum(w * np.log(w))
+    K = w.shape[0]
+
+    if K <= 1:
+        return 0.0
+
+    return float(H / np.log(K))
 
 def compute_weights_evitrack(
     npz: Dict[str, np.ndarray],
@@ -431,6 +451,7 @@ def replay_single_trajectory(
 
     # Filtering metrics (no horizon dimension)
     ess_all = np.full(T, np.nan, dtype=np.float64)
+    entropy_all = np.full(T, np.nan, dtype=np.float64)
     ba_filt_all = np.full(T, np.nan, dtype=np.float64)
     p_positive_filt_all = np.full(T, np.nan, dtype=np.float64)
     p_negative_filt_all = np.full(T, np.nan, dtype=np.float64)
@@ -449,6 +470,7 @@ def replay_single_trajectory(
         weights_t = np.exp(log_w[t])  # [K]
         weights_t = weights_t / (np.sum(weights_t) + 1e-12)  # Normalize
         ess_all[t] = 1.0 / (np.sum(weights_t ** 2) + 1e-12)
+        entropy_all[t] = _normalized_entropy(weights_t)
 
         # NEW: Compute filtering metrics from current particles
         z_t_particles = z_hyps[t, :, 0]  # [K]
@@ -591,6 +613,7 @@ def replay_single_trajectory(
             "bias_filt":            latent_bias_all,
             "var_filt":             latent_var_all,
             "ess":                  ess_all,
+            "entropy":              entropy_all,
             "dd_time_predicted":    dd_time_predicted,
 
             # Metadata
@@ -669,6 +692,7 @@ def _replay_engine(
     latent_bias_accum       = []
     latent_var_accum        = []
     ess_accum               = []
+    entropy_accum           = []
     dd_time_predicted_accum = []
 
     traj_indices      = []
@@ -711,6 +735,7 @@ def _replay_engine(
             latent_bias_accum.append(result["bias_filt"])
             latent_var_accum.append(result["var_filt"])
             ess_accum.append(result["ess"])
+            entropy_accum.append(result["entropy"])
             dd_time_predicted_accum.append(result["dd_time_predicted"])
 
             traj_indices.append(traj_idx)
@@ -737,6 +762,7 @@ def _replay_engine(
         "bias_filt":        np.stack(latent_bias_accum, axis=0),
         "var_filt":         np.stack(latent_var_accum, axis=0),
         "ess":              np.stack(ess_accum, axis=0),
+        "entropy":          np.stack(entropy_accum, axis=0),
         "dd_time_predicted": np.array(dd_time_predicted_accum, dtype=np.int64),
 
         "traj_index":  np.array(traj_indices, dtype=np.int64),
@@ -845,6 +871,7 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
             latent_bias=agg["bias_filt"],
             latent_variance=agg["var_filt"],
             ess=agg["ess"],
+            entropy=agg["entropy"],
             dd_time_predicted=agg["dd_time_predicted"],
             dd_error=agg["dd_error"],
 
@@ -892,9 +919,10 @@ def run_metric_replay(cfg: ReplayConfig, wm: torch.nn.Module) -> Dict[str, Any]:
             mean_pll = np.nanmean(agg["pll"]) if valid_mask.any() else float("nan")
             mean_mse = np.nanmean(agg["mse_obs"]) if valid_mask.any() else float("nan")
             mean_ba  = np.nanmean(agg["ba"]) if valid_mask.any() else float("nan")
+            mean_entropy = np.nanmean(agg["entropy"]) if agg["entropy"].size > 0 else float("nan")
             print(f"  Saved: {out_path}")
             print(f"  Trajectories: {n_total} ({n_delayed_cnt} delayed, {n_non_delayed} non-delayed)")
-            print(f"  Mean PLL: {mean_pll:.4f}  Mean MSE: {mean_mse:.6f}  Mean BA: {mean_ba:.4f}")
+            print(f"  Mean PLL: {mean_pll:.4f}  Mean MSE: {mean_mse:.6f}  Mean BA: {mean_ba:.4f}  Mean Entropy: {mean_entropy:.4f}")
 
         summary["saved_files"].append({
             "engine_name": engine_name,
