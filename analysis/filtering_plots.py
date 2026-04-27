@@ -47,13 +47,13 @@ from experiments.metric_loader import MetricLoader
 # =============================================================================
 DATA_PATH = project_root / "results" / "MAIN_RUN_04_16_2026" / "doublewell_analytical"
 # DATA_PATH = project_root / "results" / "G_ABLATION_04_18_2026" / "doublewell_analytical"
-FOLDER_NAME = "SCORING_ABLATION"  # subfolder in paper_figures to save into
+FOLDER_NAME = "MAIN"  # subfolder in paper_figures to save into
 SAVE_DIR  = project_root / "paper_figures" / FOLDER_NAME
 
 # =============================================================================
 # WHAT TO RUN
 # =============================================================================
-FIGURE_NAME = "scoring_ablation"  # prefix for all saved files
+FIGURE_NAME = "main"  # prefix for all saved files
 
 # Any subset of "mse", "bias_sq", "variance"
 METRICS = ["mse", "bias_sq", "variance"]
@@ -122,7 +122,7 @@ ENGINE_DISPLAY_CONFIG = {
     # ------------------------
     "SIS-PF": {
         "color": "#9467bd",
-        "alias": "SIS-PF",
+        "alias": "SIS",
         "linestyle": "-",
         "linewidth": 1.6,
     },
