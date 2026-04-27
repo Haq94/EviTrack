@@ -55,7 +55,7 @@ RUN_ALL  = True
 EXP_NAME = "doublewell_analytic_exp"   # used when RUN_ALL = False
 
 # Folder name for organizing results
-FOLDER_NAME = "EVITRACK_JOINT_GLOBAL_PRUNE_COMP_1"  # Change this for different runs (e.g., "main_run", "ablation_1")
+FOLDER_NAME = "G_ABLATION_04_18_2026"  # Change this for different runs (e.g., "main_run", "ablation_1")
 
 DEVICE      = "cuda" if torch.cuda.is_available() else "cpu"
 RESULTS_DIR = f"results/{FOLDER_NAME}"
@@ -78,17 +78,16 @@ class DoubleWellParams:
     sigma_x: float = 0.12
     z0_mean: float = 0.0
     z0_std: float = 1.0
-    threshold: float = 0.9
+    threshold: float = 0.8
 
 # Global instance
 DOUBLEWELL_PARAMS = DoubleWellParams()
 
 # Disambiguation time bin targets for main experiment
 DD_TIME_BIN_TARGETS = {
-    (0, 40): 25,      # Early disambiguation
-    (40, 80): 25,     # Mid disambiguation
-    (80, 120): 25,    # Late disambiguation
-    (120, 200): 25,    # Very late disambiguation
+    (30, 80): 100,      # Early disambiguation
+    (80, 140): 100,     # Mid disambiguation
+    (140, 170): 100,    # Late disambiguation
 }
 # Disambiguation time bin targets for pruning ablation
 DD_TIME_BIN_TARGETS_PRUNING = {
@@ -253,7 +252,7 @@ def _analytical_cfg() -> DoubleWellAnalyticalConfig:
         z0_std=p.z0_std,
 
         # Inference
-        inference_seeds=[2, 3],
+        inference_seeds=[0, 1, 2],
 
         # Replay
         horizons=[1, 5, 10],
@@ -270,7 +269,7 @@ def _pruning_ablation_cfg() -> GlobalPruningAblationConfig:
         T=p.T, a=p.a, V=p.V, dt=p.dt, sigma_z=p.sigma_z,
         d=p.d, n=p.n, sigma_x=p.sigma_x,
         z0_mean=p.z0_mean, z0_std=p.z0_std,
-        G_values=[1, 5, 10, 20],
+        G_values=[1, 5, 10],
         K=5,
         C=3,
         inference_seeds=[0, 1, 2],
@@ -366,7 +365,7 @@ def exp_doublewell_analytical_plots() -> None:
 
 
 REGISTRY: Dict[str, Any] = {
-    # "doublewell_analytical_inference": exp_doublewell_analytical_inference,
+    "doublewell_analytical_inference": exp_doublewell_analytical_inference,
     "doublewell_analytical_replay":    exp_doublewell_analytical_replay,
     # "pruning_ablation_inference": exp_pruning_ablation_inference,
     # "pruning_ablation_replay":    exp_pruning_ablation_replay,

@@ -54,7 +54,7 @@ class ReplayConfig:
     save_dir:               str         = ""
     verbose:                bool        = True
     rollout_mode:           str         = "autoregressive"  # "autoregressive" | "frozen"
-    dd_certainty_threshold: float  = 0.9  # Threshold for DD detection
+    dd_certainty_threshold: float  = 0.8  # Threshold for DD detection
 
 
 # ---------------------------------------------------------------
@@ -423,7 +423,7 @@ def replay_single_trajectory(
     device: torch.device,
     dtype: torch.dtype,
     rollout_mode: str = "autoregressive",
-    dd_certainty_threshold: float = 0.9,  # NEW
+    dd_certainty_threshold: float = 0.8,  # NEW
 ) -> Dict[str, np.ndarray]:
     data     = dict(np.load(npz_path, allow_pickle=False))
     traj_idx = int(data["traj_index"])
@@ -667,7 +667,7 @@ def _replay_engine(
     device: torch.device,
     dtype: torch.dtype,
     rollout_mode: str = "autoregressive",
-    dd_certainty_threshold: float = 0.9,  # NEW
+    dd_certainty_threshold: float = 0.8,  # NEW
     verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
 
